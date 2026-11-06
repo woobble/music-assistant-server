@@ -47,7 +47,7 @@ dependencies = [
   "gql[all]==4.0.0",
   # TEMPORARY test-drive pin — replace with PyPI release before merge (see webrtc_aiolibdatachannel_plan.md Phase C)
   "aiolibdatachannel @ git+https://github.com/music-assistant/aiolibdatachannel@feat/certpem-testdrive",
-  "pyjwt[crypto]>=2.10.1",
+  "pyjwt[crypto]>=2.15.1",
 ]
 description = "Music Assistant"
 license = {text = "Apache-2.0"}

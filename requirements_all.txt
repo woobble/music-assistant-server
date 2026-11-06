@@ -76,7 +76,7 @@ pyblu==2.1.0
 PyChromecast==14.1.0
 pycryptodome==3.24.0
 pyheos==1.0.6
-pyjwt[crypto]>=2.10.1
+pyjwt[crypto]>=2.15.1
 pylast==7.1.0
 python-fullykiosk==0.0.15
 python-google-drive-api==0.1.0

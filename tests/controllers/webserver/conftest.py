@@ -14,6 +14,7 @@ from aiohttp.test_utils import make_mocked_request
 
 from music_assistant.controllers.webserver.controller import WebserverController
 from music_assistant.controllers.webserver.websocket_client import WebsocketClientHandler
+from tests.controllers.webserver.oidc_issuer import MockOIDCIssuer
 
 if TYPE_CHECKING:
     from music_assistant_models.auth import User
@@ -49,6 +50,13 @@ async def webserver(mass_minimal: MusicAssistant) -> AsyncIterator[WebserverCont
         *(client._handle_task for client in webserver.clients if client._handle_task),
         return_exceptions=True,
     )
+
+
+@pytest.fixture
+async def mock_oidc_issuer() -> AsyncIterator[MockOIDCIssuer]:
+    """Serve a local OIDC issuer with generated signing keys for auth tests."""
+    async with MockOIDCIssuer() as issuer:
+        yield issuer
 
 
 def _create_ws_client(
