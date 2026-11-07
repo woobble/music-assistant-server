@@ -201,49 +201,10 @@ pytest tests/controllers/webserver/test_oidc_auth.py \
   tests/test_webserver_auth.py
 ```
 
-## Build a custom image with this models revision
+## Integrated OIDC Docker image
 
-The wheel is a pure Python artifact built from models commit
-`c2884424c419d8ae0279455aa7d2755de0ea2c3a`. Its SHA-256 is
-`1b4f070b02558095b003c465b9ecdb409550f66357b5702103df79478449e65a`. Rebuilding with
-`SOURCE_DATE_EPOCH=1794050005` produces the same wheel hash. The built wheel is
-`music_assistant_models-1.1.236+woobble.oidc.1-py3-none-any.whl`. The byte-identical rebuild was
-verified with Python 3.14.9, uv 0.13.7, and the commit timestamp as `SOURCE_DATE_EPOCH`.
-
-From the server repository root, prepare a temporary Docker build context. The commands build the
-server wheel from the current server checkout and the models wheel from the pinned fork commit.
-The local models version satisfies the server's existing `==1.1.236` dependency; only this
-temporary build context replaces the generated requirements entry.
-
-```sh
-BUILD_CONTEXT="$(mktemp -d)"
-mkdir -p "$BUILD_CONTEXT/dist"
-cp Dockerfile requirements_all.txt "$BUILD_CONTEXT/"
-test -z "$(git status --porcelain)"
-test "$(git -C ../music-assistant-models rev-parse HEAD)" = \
-  "c2884424c419d8ae0279455aa7d2755de0ea2c3a"
-test -z "$(git -C ../music-assistant-models status --porcelain)"
-uv build --wheel --clear --out-dir "$BUILD_CONTEXT/dist"
-(
-  cd ../music-assistant-models
-  SOURCE_DATE_EPOCH=1794050005 uv build --wheel --out-dir "$BUILD_CONTEXT/dist"
-)
-MODEL_WHEEL="music_assistant_models-1.1.236+woobble.oidc.1-py3-none-any.whl"
-sed -i "s|^music-assistant-models==1.1.236$|./dist/$MODEL_WHEEL|" \
-  "$BUILD_CONTEXT/requirements_all.txt"
-SERVER_WHEEL="$BUILD_CONTEXT/dist/music_assistant-0.0.0-py3-none-any.whl"
-SERVER_WHEEL_SHA256="$(sha256sum "$SERVER_WHEEL" | cut -d' ' -f1)"
-SERVER_REVISION="$(git rev-parse HEAD)"
-docker build -f "$BUILD_CONTEXT/Dockerfile" \
-  --build-arg BASE_IMAGE_VERSION=1.7.0 \
-  --build-arg MASS_VERSION=0.0.0 \
-  --build-arg MASS_REVISION="$SERVER_REVISION" \
-  --build-arg MASS_WHEEL_SHA256="$SERVER_WHEEL_SHA256" \
-  -t music-assistant:oidc "$BUILD_CONTEXT"
-```
-
-The server Dockerfile installs dependencies from the temporary `requirements_all.txt`, then
-installs the server wheel from the same `dist/` directory. Pin `BASE_IMAGE_VERSION` to the base
-image used by your server build. Keep the models commit and wheel checksum with the resulting
-image; do not push the image unless your deployment process is explicitly meant to publish a
-custom build.
+Build, verification, staging, licensing, and rollback instructions for the combined server,
+frontend, and models image are in
+[`oidc-docker-build.md`](oidc-docker-build.md). The models wheel remains the pure Python artifact
+from commit `c2884424c419d8ae0279455aa7d2755de0ea2c3a`, version
+`1.1.236+woobble.oidc.1`; the integrated image workflow records the wheel hash from each run.

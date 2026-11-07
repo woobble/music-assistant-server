@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "repositories": {
+    "server": {
+      "repository": "woobble/music-assistant-server",
+      "revision": "87db99cc5db430b5adff419cbd6a9cfb5a39c3ce"
+    },
+    "frontend": {
+      "repository": "woobble/music-assistant-frontend",
+      "revision": "ee04752885ecffee0719c93829c37c5f6e755008"
+    },
+    "models": {
+      "repository": "woobble/music-assistant-models",
+      "revision": "c2884424c419d8ae0279455aa7d2755de0ea2c3a"
+    }
+  },
+  "frontend_build": {
+    "assets_sha256": "ab122d82add14ebc76873053a85e632e5778ef2eaba7aadc4239edb19ba816bd"
+  },
+  "vcs_dependencies": {
+    "aiolibdatachannel": {
+      "repository": "music-assistant/aiolibdatachannel",
+      "revision": "950e7f0fef33000e701bae48e4872913cebbcc9a",
+      "replaces": "feat/certpem-testdrive"
+    },
+    "lc3py": {
+      "repository": "google/liblc3",
+      "revision": "96a3af0beb5487aca3b98a4b992a539a1f6d80d1",
+      "replaces": "v1.1.3"
+    }
+  },
+  "toolchain": {
+    "python": "3.14.9",
+    "node": "22.16.0",
+    "pnpm": "11.8.0",
+    "uv": "0.13.7",
+    "buildx": "v0.38.2",
+    "docker_buildkit_image": "moby/buildkit:buildx-stable-1@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe",
+    "python_build": "1.3.0",
+    "setuptools": "80.9.0"
+  },
+  "image": "ghcr.io/woobble/music-assistant-oidc",
+  "base": {
+    "dockerfile_frontend": "docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e",
+    "python_image": "python:3.14.9-slim-trixie@sha256:0214bda9af2652a418f2bf34373a4d3ca00a5f4784081e040049433ac9cc79d5",
+    "debian_snapshot": "20261020T213255Z",
+    "ffmpeg_version": "9.0.1",
+    "ffmpeg_sha256": "cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635",
+    "uv_image": "ghcr.io/astral-sh/uv:0.13.7@sha256:c7db1d63057f268a8b6da8af9077850a60461f98d23db23c676a82089a050c91"
+  }
+}

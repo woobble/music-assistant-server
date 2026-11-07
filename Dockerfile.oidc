@@ -1,0 +1,148 @@
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+
+# This Dockerfile follows the official Dockerfile build/install sequence. The
+# separately built OIDC base is derived from Dockerfile.base with its private
+# Widevine file copy omitted; see scripts/oidc_image.py.
+ARG BASE_IMAGE=music-assistant-oidc-base:local
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.13.7@sha256:c7db1d63057f268a8b6da8af9077850a60461f98d23db23c676a82089a050c91
+
+FROM ${UV_IMAGE} AS uv-binaries
+
+FROM --platform=$BUILDPLATFORM ${BASE_IMAGE} AS cliairplay-download
+
+# Bump the version and checksum-manifest hash together.
+ARG CLIAIRPLAY_VERSION=v0.5.9
+ARG CLIAIRPLAY_CHECKSUMS_SHA256=b007597b927ae5c88bcf568b055b3d94647f9efa2e02249749e45e48c0861bc8
+ARG TARGETARCH
+
+RUN set -eu \
+    && case "$TARGETARCH" in \
+        amd64) CLIAIRPLAY_ARCH="x86_64" ;; \
+        arm64) CLIAIRPLAY_ARCH="aarch64" ;; \
+        *) echo "Unsupported cliairplay architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && CLIAIRPLAY_BINARY="cliairplay-linux-${CLIAIRPLAY_ARCH}" \
+    && RELEASE_URL="https://github.com/music-assistant/airplay-cli/releases/download/${CLIAIRPLAY_VERSION}" \
+    && wget -q "${RELEASE_URL}/SHA256SUMS" -O /tmp/SHA256SUMS \
+    && wget -q "${RELEASE_URL}/${CLIAIRPLAY_BINARY}" -O "/tmp/${CLIAIRPLAY_BINARY}" \
+    && echo "${CLIAIRPLAY_CHECKSUMS_SHA256}  /tmp/SHA256SUMS" | sha256sum --check - \
+    && mkdir -p /cliairplay \
+    && mv "/tmp/${CLIAIRPLAY_BINARY}" "/cliairplay/${CLIAIRPLAY_BINARY}" \
+    && awk -v filename="$CLIAIRPLAY_BINARY" \
+        '$2 == filename || $2 == "*" filename' \
+        /tmp/SHA256SUMS > /tmp/cliairplay.sha256 \
+    && test "$(wc -l < /tmp/cliairplay.sha256)" -eq 1 \
+    && (cd /cliairplay && sha256sum --check /tmp/cliairplay.sha256) \
+    && chmod 755 "/cliairplay/${CLIAIRPLAY_BINARY}" \
+    && rm /tmp/SHA256SUMS /tmp/cliairplay.sha256
+
+FROM scratch AS cliairplay
+COPY --from=cliairplay-download /cliairplay /cliairplay
+
+# Build the production virtual environment with the pinned local component wheels.
+FROM ${BASE_IMAGE} AS builder
+ARG TARGETARCH
+ARG MASS_VERSION=0.0.0
+ARG MASS_REVISION
+ARG MASS_WHEEL_SHA256
+
+ADD dist dist
+COPY requirements_all.txt .
+COPY oidc-build-info.json .
+COPY verify_oidc_image.py /tmp/verify_oidc_image.py
+COPY licenses /tmp/oidc-licenses
+
+# TODO: Remove git and the compilers once aiolibdatachannel and yappi are installed from PyPI.
+RUN apt-get -o Acquire::Check-Valid-Until=false update && \
+    apt-get install -y --no-install-recommends git gcc g++ && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=uv-binaries /uv /uvx /bin/
+
+ENV VIRTUAL_ENV=/app/venv
+RUN uv venv "$VIRTUAL_ENV"
+
+ENV URLLIB3_NO_OVERRIDE=1
+RUN uv pip install \
+    --index-strategy unsafe-best-match \
+    --no-binary urllib3-future \
+    -r requirements_all.txt
+
+# Install PyAV from the wheel built against this base image's FFmpeg.
+RUN REQUIRED_VERSION=$("$VIRTUAL_ENV/bin/python" -c "import importlib.metadata; print(importlib.metadata.version('av'))") && \
+    WHEEL_VERSION=$(ls /usr/local/share/pyav-wheels/av*.whl | grep -oP 'av-\K[0-9.]+') && \
+    if [ "$REQUIRED_VERSION" != "$WHEEL_VERSION" ]; then \
+      echo "ERROR: PyAV version mismatch! Requirements need $REQUIRED_VERSION but base image has $WHEEL_VERSION" && \
+      echo "Please rebuild the base image with the matching PyAV version." && \
+      exit 1; \
+    fi && \
+    uv pip install --force-reinstall --no-deps /usr/local/share/pyav-wheels/av*.whl
+
+RUN uv pip install \
+    --no-cache \
+    "music-assistant@dist/music_assistant-${MASS_VERSION}-py3-none-any.whl"
+
+COPY --from=cliairplay /cliairplay /tmp/cliairplay
+RUN SITE_PACKAGES=$("$VIRTUAL_ENV/bin/python" -c \
+        'import sysconfig; print(sysconfig.get_path("purelib"))') \
+    && CLIAIRPLAY_BIN_DIR="${SITE_PACKAGES}/music_assistant/providers/airplay/bin" \
+    && mkdir -p "$CLIAIRPLAY_BIN_DIR" \
+    && mv /tmp/cliairplay/* "$CLIAIRPLAY_BIN_DIR/" \
+    && rmdir /tmp/cliairplay \
+    && "$CLIAIRPLAY_BIN_DIR"/cliairplay-linux-* --check
+
+RUN printf '{"version": "%s", "revision": "%s", "wheel_sha256": "%s"}\n' \
+    "$MASS_VERSION" "$MASS_REVISION" "$MASS_WHEEL_SHA256" > /app/build_info.json \
+    && cp oidc-build-info.json /app/oidc-build-info.json \
+    && cp /tmp/verify_oidc_image.py /app/verify_oidc_image.py \
+    && uv pip check \
+    && "$VIRTUAL_ENV/bin/python" /app/verify_oidc_image.py \
+        --manifest /app/oidc-build-info.json --package-only
+
+RUN "$VIRTUAL_ENV/bin/python" -m compileall -q "$VIRTUAL_ENV/lib/python"*/site-packages/music_assistant \
+    && chmod -R 777 /app \
+    && chmod 755 \
+        "$VIRTUAL_ENV"/lib/python*/site-packages/music_assistant/providers/airplay/bin/cliairplay-linux-*
+
+FROM ${BASE_IMAGE}
+
+ENV VIRTUAL_ENV=/app/venv
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+RUN apt-get -o Acquire::Check-Valid-Until=false update \
+    && apt-get install -y --no-install-recommends tini \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app /app
+COPY --from=builder /tmp/oidc-licenses/ /usr/share/licenses/music-assistant-oidc/
+RUN chmod 777 /app
+
+ARG MASS_VERSION=0.0.0
+ARG MASS_REVISION
+ARG FRONTEND_REVISION
+ARG MODELS_REVISION
+ARG TARGETPLATFORM
+LABEL \
+    org.opencontainers.image.title="Music Assistant OIDC" \
+    org.opencontainers.image.description="OIDC-enabled Music Assistant server with pinned custom frontend and models packages" \
+    org.opencontainers.image.source="https://github.com/woobble/music-assistant-server" \
+    org.opencontainers.image.revision="$MASS_REVISION" \
+    org.opencontainers.image.version="$MASS_VERSION" \
+    io.music-assistant.server.revision="$MASS_REVISION" \
+    io.music-assistant.frontend.revision="$FRONTEND_REVISION" \
+    io.music-assistant.models.revision="$MODELS_REVISION" \
+    io.hass.version="$MASS_VERSION" \
+    io.hass.platform="$TARGETPLATFORM"
+
+VOLUME ["/data"]
+EXPOSE 8095
+WORKDIR $VIRTUAL_ENV
+
+RUN printf '#!/bin/sh\n\
+for path in /usr/lib/*/libjemalloc.so.2; do\n\
+    [ -f "$path" ] && export LD_PRELOAD="$path" MALLOC_CONF="background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000" && break\n\
+done\n\
+exec mass "$@"\n\
+' > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/usr/local/bin/entrypoint.sh", "--data-dir", "/data", "--cache-dir", "/data/.cache"]

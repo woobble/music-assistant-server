@@ -1,0 +1,499 @@
+name: OIDC Docker image
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_repository:
+        description: Server fork owner/name (blank uses oidc-build.lock.json)
+        required: false
+        type: string
+      server_revision:
+        description: Full server commit SHA (blank uses oidc-build.lock.json)
+        required: false
+        type: string
+      frontend_repository:
+        description: Frontend fork owner/name (blank uses oidc-build.lock.json)
+        required: false
+        type: string
+      frontend_revision:
+        description: Full frontend commit SHA (blank uses oidc-build.lock.json)
+        required: false
+        type: string
+      models_repository:
+        description: Models fork owner/name (blank uses oidc-build.lock.json)
+        required: false
+        type: string
+      models_revision:
+        description: Full models commit SHA (blank uses oidc-build.lock.json)
+        required: false
+        type: string
+      frontend_assets_sha256:
+        description: Reviewed production frontend asset SHA-256 (blank uses oidc-build.lock.json)
+        required: false
+        type: string
+      publish_image:
+        description: Publish the verified image to the private GHCR package
+        required: true
+        default: false
+        type: boolean
+      redistribution_reviewed:
+        description: Confirm redistribution rights were reviewed for the selected scope
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oidc-image-${{ github.repository }}-${{ github.ref }}-${{ inputs.server_revision || 'locked' }}-${{ inputs.frontend_revision || 'locked' }}-${{ inputs.models_revision || 'locked' }}
+  cancel-in-progress: false
+
+jobs:
+  components:
+    name: Test pinned components and assemble build context
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+      build_tag: ${{ steps.resolve.outputs.build_tag }}
+      server_revision: ${{ steps.resolve.outputs.server_revision }}
+      frontend_revision: ${{ steps.resolve.outputs.frontend_revision }}
+      models_revision: ${{ steps.resolve.outputs.models_revision }}
+      publish: ${{ steps.resolve.outputs.publish }}
+      python: ${{ steps.resolve.outputs.python }}
+      buildx: ${{ steps.resolve.outputs.buildx }}
+      docker_buildkit_image: ${{ steps.resolve.outputs.docker_buildkit_image }}
+      server_version: ${{ steps.context.outputs.server_version }}
+      server_wheel_sha256: ${{ steps.context.outputs.server_wheel_sha256 }}
+    steps:
+      - name: Check out the reviewed build tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: builder
+          persist-credentials: false
+
+      - name: Resolve manifest pins and dispatch inputs
+        id: resolve
+        env:
+          INPUT_SERVER_REPOSITORY: ${{ inputs.server_repository }}
+          INPUT_SERVER_REVISION: ${{ inputs.server_revision }}
+          INPUT_FRONTEND_REPOSITORY: ${{ inputs.frontend_repository }}
+          INPUT_FRONTEND_REVISION: ${{ inputs.frontend_revision }}
+          INPUT_MODELS_REPOSITORY: ${{ inputs.models_repository }}
+          INPUT_MODELS_REVISION: ${{ inputs.models_revision }}
+          INPUT_FRONTEND_ASSETS_SHA256: ${{ inputs.frontend_assets_sha256 }}
+          INPUT_PUBLISH: ${{ inputs.publish_image }}
+          INPUT_REDISTRIBUTION_REVIEWED: ${{ inputs.redistribution_reviewed }}
+        run: |
+          args=(
+            --lock builder/oidc-build.lock.json
+            --output "$RUNNER_TEMP/oidc-resolved.json"
+            --github-output "$GITHUB_OUTPUT"
+            --server-repository "$INPUT_SERVER_REPOSITORY"
+            --server-revision "$INPUT_SERVER_REVISION"
+            --frontend-repository "$INPUT_FRONTEND_REPOSITORY"
+            --frontend-revision "$INPUT_FRONTEND_REVISION"
+            --models-repository "$INPUT_MODELS_REPOSITORY"
+            --models-revision "$INPUT_MODELS_REVISION"
+            --frontend-assets-sha256 "$INPUT_FRONTEND_ASSETS_SHA256"
+          )
+          if [ "$INPUT_PUBLISH" = "true" ]; then args+=(--publish); fi
+          if [ "$INPUT_REDISTRIBUTION_REVIEWED" = "true" ]; then args+=(--redistribution-reviewed); fi
+          python3 builder/scripts/oidc_image.py resolve "${args[@]}"
+
+      - name: Check out pinned server source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.resolve.outputs.server_repository }}
+          ref: ${{ steps.resolve.outputs.server_revision }}
+          path: source/server
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out pinned frontend source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.resolve.outputs.frontend_repository }}
+          ref: ${{ steps.resolve.outputs.frontend_revision }}
+          path: source/frontend
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out pinned models source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.resolve.outputs.models_repository }}
+          ref: ${{ steps.resolve.outputs.models_revision }}
+          path: source/models
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify every pinned commit is available from GitHub
+        run: |
+          python3 builder/scripts/oidc_image.py verify-sources \
+            --resolved "$RUNNER_TEMP/oidc-resolved.json" \
+            --server-dir source/server \
+            --frontend-dir source/frontend \
+            --models-dir source/models
+
+      - name: Set up Python ${{ steps.resolve.outputs.python }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ steps.resolve.outputs.python }}
+          check-latest: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ steps.resolve.outputs.uv }}
+          enable-cache: true
+          cache-dependency-glob: |
+            source/server/pyproject.toml
+            source/server/requirements_all.txt
+            source/models/pyproject.toml
+            .github/workflows/oidc-image.yml
+
+      - name: Test models fork
+        working-directory: source/models
+        run: uv run --extra test -- pytest tests/test_auth.py
+
+      - name: Build pinned models wheel
+        env:
+          MODELS_REVISION: ${{ steps.resolve.outputs.models_revision }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/models-dist"
+          SOURCE_DATE_EPOCH="$(git -C source/models show -s --format=%ct "$MODELS_REVISION")" \
+            uv build --wheel --out-dir "$RUNNER_TEMP/models-dist" source/models
+
+      - name: Set up pnpm ${{ steps.resolve.outputs.pnpm }}
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: ${{ steps.resolve.outputs.pnpm }}
+          run_install: false
+
+      - name: Set up Node ${{ steps.resolve.outputs.node }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ steps.resolve.outputs.node }}
+          cache: pnpm
+          cache-dependency-path: source/frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies from lockfile
+        working-directory: source/frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Frontend lint and formatting checks
+        working-directory: source/frontend
+        env:
+          CI: true
+        run: pnpm lint:check
+
+      - name: Frontend tests
+        working-directory: source/frontend
+        env:
+          CI: true
+        run: pnpm test:run
+
+      - name: Frontend type checks and production build
+        working-directory: source/frontend
+        env:
+          CI: true
+        run: pnpm build
+
+      - name: Stamp the production frontend and collect dependency notices
+        env:
+          FRONTEND_REPOSITORY: ${{ steps.resolve.outputs.frontend_repository }}
+          FRONTEND_REVISION: ${{ steps.resolve.outputs.frontend_revision }}
+          FRONTEND_ASSETS_SHA256: ${{ steps.resolve.outputs.frontend_assets_sha256 }}
+        run: |
+          python3 builder/scripts/oidc_image.py stamp-frontend \
+            --frontend-dir source/frontend \
+            --server-dir source/server \
+            --repository "$FRONTEND_REPOSITORY" \
+            --revision "$FRONTEND_REVISION" \
+            --expected-assets-sha256 "$FRONTEND_ASSETS_SHA256" \
+            --output "$RUNNER_TEMP/frontend-package"
+
+      - name: Build and inspect the frontend Python distribution
+        working-directory: ${{ runner.temp }}/frontend-package
+        env:
+          PYTHON_BUILD_VERSION: ${{ steps.resolve.outputs.python_build }}
+          SETUPTOOLS_VERSION: ${{ steps.resolve.outputs.setuptools }}
+          FRONTEND_REVISION: ${{ steps.resolve.outputs.frontend_revision }}
+        run: |
+          mkdir -p dist
+          python -m pip install --disable-pip-version-check \
+            "build==$PYTHON_BUILD_VERSION" "setuptools==$SETUPTOOLS_VERSION"
+          SOURCE_DATE_EPOCH="$(git -C "$GITHUB_WORKSPACE/source/frontend" show -s --format=%ct "$FRONTEND_REVISION")" \
+            TZ=UTC python -m build --no-isolation --wheel --sdist --outdir dist
+          bash "$GITHUB_WORKSPACE/source/frontend/.github/scripts/verify-python-package.sh"
+
+      - name: Build the server wheel with immutable VCS dependency pins
+        run: |
+          python3 builder/scripts/oidc_image.py build-server-wheel \
+            --server-dir source/server \
+            --resolved "$RUNNER_TEMP/oidc-resolved.json" \
+            --output "$RUNNER_TEMP/server-dist"
+
+      - name: Assemble the Docker context and resolved dependency list
+        id: context
+        run: |
+          python3 builder/scripts/oidc_image.py prepare-context \
+            --resolved "$RUNNER_TEMP/oidc-resolved.json" \
+            --server-dir source/server \
+            --frontend-dir source/frontend \
+            --models-dir source/models \
+            --server-dist "$RUNNER_TEMP/server-dist" \
+            --frontend-dist "$RUNNER_TEMP/frontend-package/dist" \
+            --models-dist "$RUNNER_TEMP/models-dist" \
+            --tools-dir builder \
+            --output "$RUNNER_TEMP/oidc-context"
+          python3 - "$RUNNER_TEMP/oidc-context/oidc-build-info.json" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          info = json.loads(Path(sys.argv[1]).read_text())
+          with Path(sys.argv[2]).open("a") as output:
+              output.write(f"server_version={info['distributions']['server']['version']}\n")
+              output.write(f"server_wheel_sha256={info['distributions']['server']['sha256']}\n")
+          PY
+
+      - name: Create auth-test requirements with the actual fork wheels
+        run: |
+          python3 builder/scripts/oidc_image.py write-test-requirements \
+            --server-dir source/server \
+            --requirements "$RUNNER_TEMP/oidc-context/requirements_all.txt" \
+            --output "$RUNNER_TEMP/oidc-test-requirements.txt"
+
+      - name: Run server OIDC and auth tests with the pinned models wheel
+        env:
+          PYTHON_VERSION: ${{ steps.resolve.outputs.python }}
+        run: |
+          cd "$RUNNER_TEMP/oidc-context"
+          uv venv "$RUNNER_TEMP/oidc-test-venv" --python "$PYTHON_VERSION"
+          uv pip install \
+            --python "$RUNNER_TEMP/oidc-test-venv/bin/python" \
+            --index-strategy unsafe-best-match \
+            --no-binary urllib3-future \
+            -r "$RUNNER_TEMP/oidc-test-requirements.txt"
+          uv pip check --python "$RUNNER_TEMP/oidc-test-venv/bin/python"
+          cd "$GITHUB_WORKSPACE/source/server"
+          "$RUNNER_TEMP/oidc-test-venv/bin/python" -m pytest \
+            tests/controllers/webserver/test_oidc_auth.py \
+            tests/controllers/webserver/test_oidc_issuer.py \
+            tests/controllers/webserver/test_login_flow.py \
+            tests/controllers/webserver/test_auth_callback.py \
+            tests/controllers/webserver/test_auth_logout.py \
+            tests/controllers/webserver/test_command_impersonation.py \
+            tests/controllers/webserver/test_roles.py \
+            tests/controllers/webserver/test_ingress_auth.py \
+            tests/test_webserver_auth.py
+
+      - name: Upload prepared image build context
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: oidc-build-context-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/oidc-context
+          if-no-files-found: error
+          retention-days: 1
+
+  build-and-verify:
+    name: Build linux/amd64 image and run integration smoke test
+    runs-on: ubuntu-24.04
+    needs: components
+    permissions:
+      contents: read
+    outputs:
+      image_ref: ${{ steps.image.outputs.image_ref }}
+      image_tar: ${{ steps.image.outputs.image_tar }}
+    steps:
+      - name: Check out the reviewed smoke-test tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: builder
+          persist-credentials: false
+
+      - name: Download prepared source wheels and Docker inputs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: oidc-build-context-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/oidc-context
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        with:
+          version: ${{ needs.components.outputs.buildx }}
+          driver-opts: image=${{ needs.components.outputs.docker_buildkit_image }}
+
+      - name: Build the upstream-compatible base without private Widevine files
+        env:
+          PYTHON_VERSION: ${{ needs.components.outputs.python }}
+          SERVER_REVISION: ${{ needs.components.outputs.server_revision }}
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            --tag "music-assistant-oidc-base:$SERVER_REVISION" \
+            --file "$RUNNER_TEMP/oidc-context/base-context/Dockerfile.base" \
+            --build-arg "PYTHON_VERSION=$PYTHON_VERSION" \
+            --cache-from type=gha,scope=music-assistant-oidc-base \
+            --cache-to type=gha,scope=music-assistant-oidc-base,mode=max \
+            "$RUNNER_TEMP/oidc-context/base-context"
+
+      - name: Build the integrated custom image
+        id: image
+        env:
+          IMAGE: ${{ needs.components.outputs.image }}
+          BUILD_TAG: ${{ needs.components.outputs.build_tag }}
+          SERVER_REVISION: ${{ needs.components.outputs.server_revision }}
+          FRONTEND_REVISION: ${{ needs.components.outputs.frontend_revision }}
+          MODELS_REVISION: ${{ needs.components.outputs.models_revision }}
+          MASS_VERSION: ${{ needs.components.outputs.server_version }}
+          MASS_WHEEL_SHA256: ${{ needs.components.outputs.server_wheel_sha256 }}
+        run: |
+          image_ref="$IMAGE:$BUILD_TAG"
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            --tag "$image_ref" \
+            --file "$RUNNER_TEMP/oidc-context/Dockerfile.oidc" \
+            --build-arg "BASE_IMAGE=music-assistant-oidc-base:$SERVER_REVISION" \
+            --build-arg "MASS_VERSION=$MASS_VERSION" \
+            --build-arg "MASS_REVISION=$SERVER_REVISION" \
+            --build-arg "FRONTEND_REVISION=$FRONTEND_REVISION" \
+            --build-arg "MODELS_REVISION=$MODELS_REVISION" \
+            --build-arg "MASS_WHEEL_SHA256=$MASS_WHEEL_SHA256" \
+            --cache-from type=gha,scope=music-assistant-oidc-image \
+            --cache-to type=gha,scope=music-assistant-oidc-image,mode=max \
+            "$RUNNER_TEMP/oidc-context"
+          echo "image_ref=$image_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the final image and run it with a new /data directory
+        run: |
+          python3 builder/scripts/smoke_test_oidc_image.py \
+            --image "${{ steps.image.outputs.image_ref }}" \
+            --startup-timeout 180
+
+      - name: Record build manifest and image configuration digest
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.image_ref }}
+          PUBLISH: ${{ needs.components.outputs.publish }}
+        run: |
+          config_digest=$(docker image inspect --format '{{.Id}}' "$IMAGE_REF")
+          {
+            echo '## OIDC image build verification'
+            echo
+            echo "- Image: `$IMAGE_REF`"
+            echo "- Local image configuration digest: `$config_digest`"
+            echo "- Publish requested: `$PUBLISH`"
+            echo
+            echo '```json'
+            cat "$RUNNER_TEMP/oidc-context/oidc-build-info.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save verified image for the isolated publishing job
+        if: ${{ needs.components.outputs.publish == 'true' }}
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.image_ref }}
+        run: |
+          docker save "$IMAGE_REF" --output "$RUNNER_TEMP/music-assistant-oidc-image.tar"
+
+      - name: Upload the exact verified image
+        if: ${{ needs.components.outputs.publish == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: oidc-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/music-assistant-oidc-image.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish verified image to GHCR
+    if: ${{ inputs.publish_image }}
+    runs-on: ubuntu-24.04
+    needs: [components, build-and-verify]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download the exact verified image archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: oidc-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/oidc-image
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        with:
+          version: ${{ needs.components.outputs.buildx }}
+          driver-opts: image=${{ needs.components.outputs.docker_buildkit_image }}
+
+      - name: Log in to the private GitHub Container Registry package
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse public, inaccessible, or already-used package tags
+        env:
+          OWNER: ${{ github.repository_owner }}
+          IMAGE_REF: ${{ needs.build-and-verify.outputs.image_ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/users/$OWNER/packages/container/music-assistant-oidc"
+          status=$(curl --silent --show-error --output "$RUNNER_TEMP/package.json" \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' "$api")
+          if [ "$status" = 200 ]; then
+            visibility=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("visibility", "unknown"))' "$RUNNER_TEMP/package.json")
+            if [ "$visibility" != "private" ]; then
+              echo "::error::Refusing to push into a GHCR package with visibility '$visibility'. Set the package to private first."
+              exit 1
+            fi
+          elif [ "$status" != 404 ]; then
+            echo "::error::Could not verify GHCR package visibility (HTTP $status)."
+            exit 1
+          fi
+          if docker buildx imagetools inspect "$IMAGE_REF" >"$RUNNER_TEMP/tag-inspect.txt" 2>&1; then
+            echo "::error::Refusing to overwrite existing versioned image tag $IMAGE_REF."
+            exit 1
+          fi
+          if ! rg -qi 'not found|manifest unknown|status.*404' "$RUNNER_TEMP/tag-inspect.txt"; then
+            cat "$RUNNER_TEMP/tag-inspect.txt" >&2
+            echo "::error::Could not prove the versioned image tag is unused."
+            exit 1
+          fi
+
+      - name: Push immutable commit-derived tag and record registry digest
+        env:
+          IMAGE_REF: ${{ needs.build-and-verify.outputs.image_ref }}
+          SERVER_REVISION: ${{ needs.components.outputs.server_revision }}
+          FRONTEND_REVISION: ${{ needs.components.outputs.frontend_revision }}
+          MODELS_REVISION: ${{ needs.components.outputs.models_revision }}
+        run: |
+          set -euo pipefail
+          docker load --input "$RUNNER_TEMP/oidc-image/music-assistant-oidc-image.tar"
+          docker push "$IMAGE_REF" | tee "$RUNNER_TEMP/docker-push.log"
+          digest=$(sed -nE 's/.*digest: (sha256:[0-9a-f]{64}).*/\1/p' "$RUNNER_TEMP/docker-push.log" | tail -n 1)
+          if [ -z "$digest" ]; then
+            echo "::error::Registry push succeeded but no image digest was reported."
+            exit 1
+          fi
+          {
+            echo '## Published OIDC image'
+            echo
+            echo "- Image: `$IMAGE_REF`"
+            echo "- Registry digest: `$digest`"
+            echo "- Server: `$SERVER_REVISION`"
+            echo "- Frontend: `$FRONTEND_REVISION`"
+            echo "- Models: `$MODELS_REVISION`"
+            echo '- Visibility: `private`'
+          } >> "$GITHUB_STEP_SUMMARY"
