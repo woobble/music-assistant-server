@@ -57,15 +57,6 @@ def normalize_username(username: str) -> str:
     return username.strip().lower()
 
 
-def get_oidc_auth_provider_type() -> AuthProviderType:
-    """Return the OIDC member from a models package that supports OIDC identities."""
-    if provider_type := AuthProviderType.__members__.get("OIDC"):
-        return provider_type
-    raise RuntimeError(
-        "OIDC authentication requires AuthProviderType.OIDC in music-assistant-models"
-    )
-
-
 async def get_ha_user_details(
     mass: MusicAssistant, ha_user_id: str, wait_timeout: float = 10.0
 ) -> tuple[str | None, str | None, str | None]:

@@ -65,7 +65,6 @@ from music_assistant.controllers.webserver.helpers.auth_providers import (
     HomeAssistantProviderConfig,
     LoginProvider,
     LoginRateLimiter,
-    get_oidc_auth_provider_type,
     normalize_username,
 )
 from music_assistant.controllers.webserver.helpers.login_flow import (
@@ -672,7 +671,7 @@ class AuthenticationManager:
         """
         async with self._oidc_registration_lock:
             existing_user = await self.get_user_by_provider_link(
-                get_oidc_auth_provider_type(), identity.provider_user_id, include_disabled=True
+                AuthProviderType.OIDC, identity.provider_user_id, include_disabled=True
             )
             if existing_user:
                 if not existing_user.enabled:
@@ -712,7 +711,7 @@ class AuthenticationManager:
                 link_data = {
                     "link_id": link_id,
                     "user_id": user_id,
-                    "provider_type": get_oidc_auth_provider_type().value,
+                    "provider_type": AuthProviderType.OIDC.value,
                     "provider_user_id": identity.provider_user_id,
                     "created_at": created_at.isoformat(),
                 }
@@ -723,7 +722,7 @@ class AuthenticationManager:
                             "WHERE provider_type = :provider_type "
                             "AND provider_user_id = :provider_user_id",
                             {
-                                "provider_type": get_oidc_auth_provider_type().value,
+                                "provider_type": AuthProviderType.OIDC.value,
                                 "provider_user_id": identity.provider_user_id,
                             },
                         ) as cursor:
@@ -754,7 +753,7 @@ class AuthenticationManager:
                     # If the identity was linked concurrently, the unique provider key tells
                     # us which account won. Username collisions are retried with a new suffix.
                     existing_user = await self.get_user_by_provider_link(
-                        get_oidc_auth_provider_type(),
+                        AuthProviderType.OIDC,
                         identity.provider_user_id,
                         include_disabled=True,
                     )
@@ -1588,7 +1587,7 @@ class AuthenticationManager:
                     )
                 await self.link_user_to_provider(
                     user,
-                    get_oidc_auth_provider_type(),
+                    AuthProviderType.OIDC,
                     identity.provider_user_id,
                     required_session_hash=pending.initiating_session_hash,
                 )
@@ -2262,9 +2261,7 @@ class AuthenticationManager:
         if not confirmed:
             raise InvalidDataError("Explicit confirmation is required")
         await self._require_recent_user_session(user)
-        return await self.unlink_provider_links(
-            user, get_oidc_auth_provider_type(), link_id=link_id
-        )
+        return await self.unlink_provider_links(user, AuthProviderType.OIDC, link_id=link_id)
 
     @api_command("auth/oidc/registration_policy", required_scope=Scope.USERS_MANAGE)
     async def get_oidc_registration_policy(self) -> dict[str, bool]:

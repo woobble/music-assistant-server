@@ -47,9 +47,6 @@ from music_assistant.controllers.webserver.helpers.auth_middleware import (
     set_current_token,
     set_current_user,
 )
-from music_assistant.controllers.webserver.helpers.auth_providers import (
-    get_oidc_auth_provider_type,
-)
 from music_assistant.controllers.webserver.helpers.oidc_provider import (
     OIDCLoginProvider,
     OIDCProviderConfig,
@@ -162,7 +159,7 @@ async def test_oidc_configuration_uses_a_secure_secret_and_linked_only_policy(
             [
                 item
                 for item in auth.login_providers.values()
-                if item.provider_type is get_oidc_auth_provider_type()
+                if item.provider_type is AuthProviderType.OIDC
             ]
         )
         == 1
@@ -198,7 +195,7 @@ async def _linked_user(
 ) -> User:
     user = await auth.create_user("listener", display_name="Local profile name")
     await auth.link_user_to_provider(
-        user, get_oidc_auth_provider_type(), oidc_identity_key(issuer.issuer, MOCK_SUBJECT)
+        user, AuthProviderType.OIDC, oidc_identity_key(issuer.issuer, MOCK_SUBJECT)
     )
     if disabled:
         await auth.database.update("users", {"user_id": user.user_id}, {"enabled": 0})
@@ -624,7 +621,7 @@ async def test_oidc_identity_keys_separate_issuer_collisions(
     _register_oidc_provider(auth, mock_oidc_issuer)
     user = await auth.create_user("listener")
     other_issuer_key = oidc_identity_key("https://other.example/issuer", MOCK_SUBJECT)
-    await auth.link_user_to_provider(user, get_oidc_auth_provider_type(), other_issuer_key)
+    await auth.link_user_to_provider(user, AuthProviderType.OIDC, other_issuer_key)
 
     pending, callback_params = await _start_login(auth, mock_oidc_issuer)
     result = await _finish_login(auth, pending, callback_params)
@@ -735,7 +732,7 @@ async def test_oidc_linking_existing_account_is_single_use_and_enables_login(
     assert result.linked is True
     assert result.user is None
     linked_user = await auth.get_user_by_provider_link(
-        get_oidc_auth_provider_type(), oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT)
+        AuthProviderType.OIDC, oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT)
     )
     assert linked_user is not None
     assert linked_user.user_id == user.user_id
@@ -743,7 +740,7 @@ async def test_oidc_linking_existing_account_is_single_use_and_enables_login(
         await auth.database.get_count_from_query(
             "SELECT link_id FROM user_auth_providers WHERE user_id = :user_id "
             "AND provider_type = :provider_type",
-            {"user_id": user.user_id, "provider_type": get_oidc_auth_provider_type().value},
+            {"user_id": user.user_id, "provider_type": AuthProviderType.OIDC.value},
         )
         == 1
     )
@@ -751,7 +748,7 @@ async def test_oidc_linking_existing_account_is_single_use_and_enables_login(
 
     original_link = await auth.database.get_row(
         "user_auth_providers",
-        {"user_id": user.user_id, "provider_type": get_oidc_auth_provider_type().value},
+        {"user_id": user.user_id, "provider_type": AuthProviderType.OIDC.value},
     )
     assert original_link is not None
     _token, repeat_pending, repeat_params, repeat_binding = await _start_link(
@@ -764,13 +761,13 @@ async def test_oidc_linking_existing_account_is_single_use_and_enables_login(
         await auth.database.get_count_from_query(
             "SELECT link_id FROM user_auth_providers WHERE user_id = :user_id "
             "AND provider_type = :provider_type",
-            {"user_id": user.user_id, "provider_type": get_oidc_auth_provider_type().value},
+            {"user_id": user.user_id, "provider_type": AuthProviderType.OIDC.value},
         )
         == 1
     )
     repeated_link = await auth.database.get_row(
         "user_auth_providers",
-        {"user_id": user.user_id, "provider_type": get_oidc_auth_provider_type().value},
+        {"user_id": user.user_id, "provider_type": AuthProviderType.OIDC.value},
     )
     assert repeated_link is not None
     assert repeated_link["link_id"] == original_link["link_id"]
@@ -947,7 +944,7 @@ async def test_oidc_link_callback_returns_no_session_and_clears_binding_cookie(
     assert response.headers["Cache-Control"] == "no-store"
     assert response.cookies[cookie_name]["max-age"] == "0"
     linked_user = await auth.get_user_by_provider_link(
-        get_oidc_auth_provider_type(), oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT)
+        AuthProviderType.OIDC, oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT)
     )
     assert linked_user is not None
     assert linked_user.user_id == user.user_id
@@ -965,7 +962,7 @@ async def test_oidc_provider_list_hides_password_and_encoded_oidc_identity(
     await auth.link_user_to_provider(user, AuthProviderType.HOME_ASSISTANT, "ha-user-id")
     await auth.link_user_to_provider(
         user,
-        get_oidc_auth_provider_type(),
+        AuthProviderType.OIDC,
         oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT),
     )
     set_current_user(user)
@@ -976,7 +973,7 @@ async def test_oidc_provider_list_hides_password_and_encoded_oidc_identity(
 
     by_type = {provider["provider_type"]: provider for provider in providers}
     assert by_type[AuthProviderType.BUILTIN.value]["provider_user_id"] == ""
-    assert by_type[get_oidc_auth_provider_type().value]["provider_user_id"] == ""
+    assert by_type[AuthProviderType.OIDC.value]["provider_user_id"] == ""
     assert by_type[AuthProviderType.HOME_ASSISTANT.value]["provider_user_id"] == "ha-user-id"
     assert "password-hash-secret" not in json.dumps(providers)
     assert oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT) not in json.dumps(providers)
@@ -1001,7 +998,7 @@ async def test_oidc_link_rejects_identity_owned_by_another_user(
     assert result.user is None
     assert (
         await auth.get_user_by_provider_link(
-            get_oidc_auth_provider_type(), oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT)
+            AuthProviderType.OIDC, oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT)
         )
         == owner
     )
@@ -1009,7 +1006,7 @@ async def test_oidc_link_rejects_identity_owned_by_another_user(
         await auth.database.get_count_from_query(
             "SELECT link_id FROM user_auth_providers WHERE user_id = :user_id "
             "AND provider_type = :provider_type",
-            {"user_id": other_user.user_id, "provider_type": get_oidc_auth_provider_type().value},
+            {"user_id": other_user.user_id, "provider_type": AuthProviderType.OIDC.value},
         )
         == 0
     )
@@ -1033,14 +1030,14 @@ async def test_oidc_concurrent_link_attempts_cannot_transfer_identity(
 
     assert sum(result.success for result in results) == 1
     linked_user = await auth.get_user_by_provider_link(
-        get_oidc_auth_provider_type(), oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT)
+        AuthProviderType.OIDC, oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT)
     )
     assert linked_user is not None
     assert linked_user.user_id in {first_user.user_id, second_user.user_id}
     assert (
         await auth.database.get_count_from_query(
             "SELECT link_id FROM user_auth_providers WHERE provider_type = :provider_type",
-            {"provider_type": get_oidc_auth_provider_type().value},
+            {"provider_type": AuthProviderType.OIDC.value},
         )
         == 1
     )
@@ -1061,7 +1058,7 @@ async def test_oidc_link_rechecks_disabled_user_and_session_binding(
     assert not replay.success
     assert (
         await auth.get_user_by_provider_link(
-            get_oidc_auth_provider_type(), oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT)
+            AuthProviderType.OIDC, oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT)
         )
         is None
     )
@@ -1075,7 +1072,7 @@ async def test_oidc_link_rechecks_disabled_user_and_session_binding(
     assert not result.success
     assert (
         await auth.get_user_by_provider_link(
-            get_oidc_auth_provider_type(), oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT)
+            AuthProviderType.OIDC, oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT)
         )
         is None
     )
@@ -1147,7 +1144,7 @@ async def test_oidc_link_denial_and_cancellation_do_not_create_links(
     assert "do-not-display" not in (result.error or "")
     assert (
         await auth.get_user_by_provider_link(
-            get_oidc_auth_provider_type(), oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT)
+            AuthProviderType.OIDC, oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT)
         )
         is None
     )
@@ -1164,7 +1161,7 @@ async def test_oidc_unlink_is_confirmed_reauthenticated_idempotent_and_preserves
     await auth.link_user_to_provider(user, AuthProviderType.BUILTIN, "test-password-hash")
     oidc_link = await auth.link_user_to_provider(
         user,
-        get_oidc_auth_provider_type(),
+        AuthProviderType.OIDC,
         oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT),
     )
     token = await auth.create_token(user, "recent unlink session")
@@ -1182,9 +1179,7 @@ async def test_oidc_unlink_is_confirmed_reauthenticated_idempotent_and_preserves
     assert await auth.get_user(user.user_id) == user
     assert await auth.authenticate_with_token(token) is not None
     assert (
-        await auth.get_user_by_provider_link(
-            get_oidc_auth_provider_type(), oidc_link.provider_user_id
-        )
+        await auth.get_user_by_provider_link(AuthProviderType.OIDC, oidc_link.provider_user_id)
         is None
     )
 
@@ -1200,7 +1195,7 @@ async def test_oidc_unlink_cannot_target_another_user_or_remove_last_login(
     other = await auth.create_user("unlink-other")
     other_link = await auth.link_user_to_provider(
         other,
-        get_oidc_auth_provider_type(),
+        AuthProviderType.OIDC,
         oidc_identity_key(mock_oidc_issuer.issuer, "other-subject"),
     )
     await auth.link_user_to_provider(owner, AuthProviderType.BUILTIN, "owner-password-hash")
@@ -1217,7 +1212,7 @@ async def test_oidc_unlink_cannot_target_another_user_or_remove_last_login(
     only_oidc_user = await auth.create_user("unlink-last")
     only_link = await auth.link_user_to_provider(
         only_oidc_user,
-        get_oidc_auth_provider_type(),
+        AuthProviderType.OIDC,
         oidc_identity_key(mock_oidc_issuer.issuer, "only-subject"),
     )
     only_token = await auth.create_token(only_oidc_user, "last provider session")
@@ -1229,9 +1224,7 @@ async def test_oidc_unlink_cannot_target_another_user_or_remove_last_login(
     finally:
         set_current_token(None)
         set_current_user(None)
-    assert await auth.get_user_by_provider_link(
-        get_oidc_auth_provider_type(), only_link.provider_user_id
-    )
+    assert await auth.get_user_by_provider_link(AuthProviderType.OIDC, only_link.provider_user_id)
 
 
 async def test_oidc_unlink_requires_a_recent_session_and_admin_override_is_explicit(
@@ -1245,7 +1238,7 @@ async def test_oidc_unlink_requires_a_recent_session_and_admin_override_is_expli
     await auth.link_user_to_provider(user, AuthProviderType.BUILTIN, "test-password-hash")
     link = await auth.link_user_to_provider(
         user,
-        get_oidc_auth_provider_type(),
+        AuthProviderType.OIDC,
         oidc_identity_key(mock_oidc_issuer.issuer, "old-session"),
     )
     token = await auth.create_token(user, "old unlink session")
@@ -1270,16 +1263,15 @@ async def test_oidc_unlink_requires_a_recent_session_and_admin_override_is_expli
     set_current_token(admin_token)
     try:
         with pytest.raises(InvalidDataError, match="confirmation"):
-            await auth.unlink_provider(user.user_id, get_oidc_auth_provider_type().value, False)
+            await auth.unlink_provider(user.user_id, AuthProviderType.OIDC.value, False)
         with pytest.raises(InvalidDataError, match="Unknown authentication provider"):
             await auth.unlink_provider(user.user_id, "unknown-provider", True)
-        assert await auth.unlink_provider(user.user_id, get_oidc_auth_provider_type().value, True)
+        assert await auth.unlink_provider(user.user_id, AuthProviderType.OIDC.value, True)
     finally:
         set_current_token(None)
         set_current_user(None)
     assert (
-        await auth.get_user_by_provider_link(get_oidc_auth_provider_type(), link.provider_user_id)
-        is None
+        await auth.get_user_by_provider_link(AuthProviderType.OIDC, link.provider_user_id) is None
     )
     assert await auth.get_user(user.user_id) is not None
 
@@ -1338,7 +1330,7 @@ async def test_oidc_registration_provisions_only_regular_users_after_verificatio
     assert result.user.username == "mock-listener"
     assert (
         await auth.get_user_by_provider_link(
-            get_oidc_auth_provider_type(), oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT)
+            AuthProviderType.OIDC, oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT)
         )
         == result.user
     )
@@ -1365,7 +1357,7 @@ async def test_oidc_registration_username_collision_never_links_by_profile(
     assert (await auth.get_user(existing.user_id)) == existing
     assert (
         await auth.get_user_by_provider_link(
-            get_oidc_auth_provider_type(), oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT)
+            AuthProviderType.OIDC, oidc_identity_key(mock_oidc_issuer.issuer, MOCK_SUBJECT)
         )
         == result.user
     )
@@ -1398,7 +1390,7 @@ async def test_oidc_concurrent_registration_creates_one_user_and_link(
     assert (
         await auth.database.get_count_from_query(
             "SELECT link_id FROM user_auth_providers WHERE provider_type = :provider_type",
-            {"provider_type": get_oidc_auth_provider_type().value},
+            {"provider_type": AuthProviderType.OIDC.value},
         )
         == 1
     )

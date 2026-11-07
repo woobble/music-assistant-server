@@ -17,6 +17,7 @@ from urllib.parse import parse_qsl, quote_plus, urlencode, urlsplit, urlunsplit
 import aiohttp
 import jwt
 from jwt.exceptions import InvalidSignatureError, PyJWTError
+from music_assistant_models.auth import AuthProviderType
 from music_assistant_models.errors import AuthenticationFailed
 
 from music_assistant.constants import CONF_AUTH_OIDC_ALLOW_REGISTRATION
@@ -24,7 +25,6 @@ from music_assistant.controllers.webserver.helpers.auth_providers import (
     AuthResult,
     LoginProvider,
     LoginProviderConfig,
-    get_oidc_auth_provider_type,
 )
 from music_assistant.controllers.webserver.helpers.login_flow import (
     AuthTransactionIntent,
@@ -33,7 +33,7 @@ from music_assistant.controllers.webserver.helpers.login_flow import (
 from music_assistant.helpers.pkce import pkce_challenge
 
 if TYPE_CHECKING:
-    from music_assistant_models.auth import AuthProviderType, User
+    from music_assistant_models.auth import User
 
     from music_assistant import MusicAssistant
 
@@ -156,7 +156,7 @@ class OIDCLoginProvider(LoginProvider):
     @property
     def provider_type(self) -> AuthProviderType:
         """Return the OIDC auth provider type."""
-        return get_oidc_auth_provider_type()
+        return AuthProviderType.OIDC
 
     @property
     def requires_redirect(self) -> bool:
@@ -230,7 +230,7 @@ class OIDCLoginProvider(LoginProvider):
             raise AuthenticationFailed("This OIDC transaction is not a sign-in")
         identity = await self.verify_identity(pending, params)
         user = await self.auth_manager.get_user_by_provider_link(
-            get_oidc_auth_provider_type(), identity.provider_user_id, include_disabled=True
+            AuthProviderType.OIDC, identity.provider_user_id, include_disabled=True
         )
         if user is not None:
             if not user.enabled:

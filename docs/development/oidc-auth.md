@@ -7,12 +7,15 @@ The webserver has a generic OIDC login provider with one configured issuer, regi
 and MA token issuance path. Pocket ID is one possible issuer; the implementation has no
 Pocket ID-specific URLs, claim names, or identity rules.
 
-This is backend-only. Enabled MA users can sign in with an OIDC identity that has been explicitly
-linked, and an authenticated user can link an identity through the web callback. Optional OIDC
-registration is disabled by default and can be enabled by an administrator. The provider never
-matches accounts by email or username, grants roles from OIDC claims, or advertises Remote Access
-app sign-in. Frontend integration and browser, desktop and mobile callback compatibility remain
-Goal 4 work.
+Enabled MA users can sign in with an OIDC identity that has been explicitly linked, and an
+authenticated user can link an identity through the web callback. Optional OIDC registration is
+disabled by default and can be enabled by an administrator. The provider never matches accounts
+by email or username, grants roles from OIDC claims, or advertises Remote Access app sign-in.
+
+Frontend commit `ee04752885ecffee0719c93829c37c5f6e755008` declares
+`AuthProviderType.OIDC = "oidc"` and uses the same `provider_type` string in its linked-provider
+models. Frontend and backend tests cover that wire value. A custom server image still needs the
+matching frontend package if it should include the OIDC screens.
 
 ## Configuration
 
@@ -125,26 +128,36 @@ total, five-second connect and five-second read timeouts, cap response bodies at
 redirects. Token, key and userinfo failures map to generic login errors; authorization codes,
 tokens, client secrets and PKCE verifiers are not logged or included in HTTP errors.
 
-The provider does not advertise `supports_remote_app` yet. The existing app callback omits the
-provider ID and is implemented in the separate frontend package; Goal 4 must verify its callback
-and cancellation/error behavior before OIDC is exposed over Remote Access.
+The provider does not advertise `supports_remote_app`, so Remote Access app sign-in remains
+disabled even though the frontend branch understands the `oidc` provider type.
 
 ## Identity storage and models
 
-The shared [`music-assistant/models` repository](https://github.com/music-assistant/models)
-contains `AuthProviderType.OIDC = "oidc"`. The existing serialized values remain `builtin` and
-`homeassistant`; the unknown-value fallback to `BUILTIN` is unchanged. A `UserAuthProvider` with
-the OIDC value round-trips through model serialization. The server development environment uses
-an editable checkout of the shared models source until a published models release includes the
-enum; a normal server install must use that updated shared package before OIDC login is enabled.
+The [`woobble/music-assistant-models` fork](https://github.com/woobble/music-assistant-models)
+defines `AuthProviderType.OIDC = "oidc"` in commit
+`c2884424c419d8ae0279455aa7d2755de0ea2c3a`, package version
+`1.1.236+woobble.oidc.1`. The existing serialized values remain `builtin` and `homeassistant`;
+the unknown-value fallback to `BUILTIN` is unchanged. A `UserAuthProvider` with the OIDC value
+round-trips through model JSON serialization.
+
+The server development environment uses the fork in editable mode:
+
+```sh
+uv pip install -e ../music-assistant-models --config-settings editable_mode=strict
+```
+
+The normal server dependency remains pinned to the upstream `1.1.236` package. It does not contain
+this enum, so an OIDC server build must include the fork wheel described below. No PyPI release or
+production deployment is part of this work.
 
 The auth database already has a unique constraint on
 `(provider_type, provider_user_id)`. OIDC stores an unambiguous versioned base64url encoding of a
 compact JSON `[issuer, sub]` pair as `provider_user_id`, so issuers cannot collide on the same
 subject. There is no table or column change and no database migration is required. The existing
-unknown-enum fallback means an older server/model build would interpret an OIDC link as `builtin`;
-do not run OIDC links on a build that lacks the new enum, and treat rollback to such a build as
-unsupported until a rollback strategy exists.
+unknown-enum fallback means an older server/model build would interpret an OIDC link as `builtin`
+and serialize it back as `builtin`. Keep models versions aligned across the server and any client
+that deserializes these links. Do not run OIDC links on a build that lacks the new enum, and treat
+rollback to such a build as unsupported until a rollback strategy exists.
 
 Account linking and optional provisioning use the existing database uniqueness constraint on
 `(provider_type, provider_user_id)`. Link creation and new-user creation plus link insertion run
@@ -181,13 +194,56 @@ pytest tests/controllers/webserver/test_oidc_auth.py \
   tests/controllers/webserver/test_oidc_issuer.py \
   tests/controllers/webserver/test_login_flow.py \
   tests/controllers/webserver/test_auth_callback.py \
-  tests/controllers/webserver/test_ingress_auth.py
+  tests/controllers/webserver/test_auth_logout.py \
+  tests/controllers/webserver/test_command_impersonation.py \
+  tests/controllers/webserver/test_roles.py \
+  tests/controllers/webserver/test_ingress_auth.py \
+  tests/test_webserver_auth.py
 ```
 
-## Remaining work
+## Build a custom image with this models revision
 
-- **Goal 4:** frontend integration for starting and managing linked identities, plus browser,
-  desktop and mobile callback compatibility. Verify provider denial/cancellation behavior and
-  token handling end to end before enabling Remote Access sign-in.
-- Publish the coordinated models release before deploying this server change to environments
-  that install the shared package from its normal package index.
+The wheel is a pure Python artifact built from models commit
+`c2884424c419d8ae0279455aa7d2755de0ea2c3a`. Its SHA-256 is
+`1b4f070b02558095b003c465b9ecdb409550f66357b5702103df79478449e65a`. Rebuilding with
+`SOURCE_DATE_EPOCH=1794050005` produces the same wheel hash. The built wheel is
+`music_assistant_models-1.1.236+woobble.oidc.1-py3-none-any.whl`. The byte-identical rebuild was
+verified with Python 3.14.9, uv 0.13.7, and the commit timestamp as `SOURCE_DATE_EPOCH`.
+
+From the server repository root, prepare a temporary Docker build context. The commands build the
+server wheel from the current server checkout and the models wheel from the pinned fork commit.
+The local models version satisfies the server's existing `==1.1.236` dependency; only this
+temporary build context replaces the generated requirements entry.
+
+```sh
+BUILD_CONTEXT="$(mktemp -d)"
+mkdir -p "$BUILD_CONTEXT/dist"
+cp Dockerfile requirements_all.txt "$BUILD_CONTEXT/"
+test -z "$(git status --porcelain)"
+test "$(git -C ../music-assistant-models rev-parse HEAD)" = \
+  "c2884424c419d8ae0279455aa7d2755de0ea2c3a"
+test -z "$(git -C ../music-assistant-models status --porcelain)"
+uv build --wheel --clear --out-dir "$BUILD_CONTEXT/dist"
+(
+  cd ../music-assistant-models
+  SOURCE_DATE_EPOCH=1794050005 uv build --wheel --out-dir "$BUILD_CONTEXT/dist"
+)
+MODEL_WHEEL="music_assistant_models-1.1.236+woobble.oidc.1-py3-none-any.whl"
+sed -i "s|^music-assistant-models==1.1.236$|./dist/$MODEL_WHEEL|" \
+  "$BUILD_CONTEXT/requirements_all.txt"
+SERVER_WHEEL="$BUILD_CONTEXT/dist/music_assistant-0.0.0-py3-none-any.whl"
+SERVER_WHEEL_SHA256="$(sha256sum "$SERVER_WHEEL" | cut -d' ' -f1)"
+SERVER_REVISION="$(git rev-parse HEAD)"
+docker build -f "$BUILD_CONTEXT/Dockerfile" \
+  --build-arg BASE_IMAGE_VERSION=1.7.0 \
+  --build-arg MASS_VERSION=0.0.0 \
+  --build-arg MASS_REVISION="$SERVER_REVISION" \
+  --build-arg MASS_WHEEL_SHA256="$SERVER_WHEEL_SHA256" \
+  -t music-assistant:oidc "$BUILD_CONTEXT"
+```
+
+The server Dockerfile installs dependencies from the temporary `requirements_all.txt`, then
+installs the server wheel from the same `dist/` directory. Pin `BASE_IMAGE_VERSION` to the base
+image used by your server build. Keep the models commit and wheel checksum with the resulting
+image; do not push the image unless your deployment process is explicitly meant to publish a
+custom build.
