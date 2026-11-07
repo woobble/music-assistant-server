@@ -7,6 +7,7 @@ import hashlib
 import json
 import time
 from collections.abc import AsyncGenerator
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
@@ -25,6 +26,7 @@ from music_assistant_models.errors import (
 )
 
 from music_assistant.constants import (
+    APP_MA_HOST,
     CONF_AUTH_OIDC_ALLOW_REGISTRATION,
     CONF_AUTH_OIDC_CLIENT_ID,
     CONF_AUTH_OIDC_CLIENT_SECRET,
@@ -826,38 +828,96 @@ async def test_oidc_link_start_requires_authentication_confirmation_and_permissi
 
 async def test_oidc_link_start_response_sets_only_a_short_lived_browser_binding(
     oidc_auth_manager: AuthenticationManager,
-    mock_oidc_issuer: MockOIDCIssuer,
 ) -> None:
     """The start response returns the authorization URL and keeps binding state in a cookie."""
     auth = oidc_auth_manager
-    _register_oidc_provider(auth, mock_oidc_issuer)
     user = await auth.create_user("link-start")
     token = await auth.create_token(user, "link start test")
+    pending = SimpleNamespace(state=f"l.{'a' * 43}")
     request = make_mocked_request(
         "POST",
         "/auth/oidc/link/start",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Origin": APP_MA_HOST,
+        },
     )
     request._read_bytes = b'{"confirmed":true}'
-    with patch(
-        "music_assistant.controllers.webserver.controller.get_authenticated_user",
-        new=AsyncMock(return_value=user),
+    with (
+        patch(
+            "music_assistant.controllers.webserver.controller.get_authenticated_user",
+            new=AsyncMock(return_value=user),
+        ),
+        patch.object(
+            auth,
+            "start_oidc_link",
+            new=AsyncMock(
+                return_value=("https://idp.example/authorize", pending, "callback-binding")
+            ),
+        ),
     ):
         response = await auth.webserver._handle_oidc_link_start(request)
 
     assert response.status == 200
+    assert response.headers["Access-Control-Allow-Origin"] == APP_MA_HOST
+    assert response.headers["Access-Control-Allow-Credentials"] == "true"
+    assert response.headers["Vary"] == "Origin"
     assert response.text is not None
     payload = json.loads(response.text)
     assert set(payload) == {"authorization_url"}
     assert "code_verifier" not in response.text
     assert "client_secret" not in response.text
-    pending = next(iter(auth.pending_logins._pending.values()))
     cookie_name = oidc_link_cookie_name(pending.state)
     assert cookie_name is not None
     cookie = response.cookies[cookie_name]
     assert cookie["httponly"]
     assert cookie["samesite"] == "Lax"
     assert cookie["max-age"] == "600"
+
+
+async def test_oidc_link_preflight_allows_trusted_remote_access_origin(
+    oidc_auth_manager: AuthenticationManager,
+) -> None:
+    """Remote Access can make the credentialed link-start request."""
+    request = make_mocked_request(
+        "OPTIONS",
+        "/auth/oidc/link/start",
+        headers={
+            "Origin": APP_MA_HOST,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+
+    response = await oidc_auth_manager.webserver._handle_oidc_link_start_preflight(request)
+
+    assert response.status == 204
+    assert response.headers["Access-Control-Allow-Origin"] == APP_MA_HOST
+    assert response.headers["Access-Control-Allow-Credentials"] == "true"
+    assert response.headers["Access-Control-Allow-Methods"] == "POST, OPTIONS"
+    assert response.headers["Access-Control-Allow-Headers"] == "Content-Type, Authorization"
+    assert response.headers["Vary"] == "Origin"
+
+
+async def test_oidc_link_preflight_rejects_untrusted_origin(
+    oidc_auth_manager: AuthenticationManager,
+) -> None:
+    """An arbitrary website cannot read a credentialed link-start response."""
+    request = make_mocked_request(
+        "OPTIONS",
+        "/auth/oidc/link/start",
+        headers={
+            "Origin": "https://attacker.example",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+
+    response = await oidc_auth_manager.webserver._handle_oidc_link_start_preflight(request)
+
+    assert response.status == 403
+    assert "Access-Control-Allow-Origin" not in response.headers
 
 
 async def test_oidc_link_callback_returns_no_session_and_clears_binding_cookie(

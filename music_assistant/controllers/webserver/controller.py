@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import html
 import inspect
+import ipaddress
 import json
 import os
 import secrets
@@ -406,7 +407,7 @@ class WebserverController(CoreController):
         routes.append(("GET", "/auth/providers", self._handle_auth_providers))
         routes.append(("GET", "/auth/authorize", self._handle_auth_authorize))
         routes.append(("POST", "/auth/oidc/link/start", self._handle_oidc_link_start))
-        routes.append(("OPTIONS", "/auth/oidc/link/start", self._handle_cors_preflight))
+        routes.append(("OPTIONS", "/auth/oidc/link/start", self._handle_oidc_link_start_preflight))
         routes.append(("GET", "/auth/callback", self._handle_auth_callback))
         # add first-time setup routes
         routes.append(("GET", "/setup", self._handle_setup_page))
@@ -867,6 +868,73 @@ class WebserverController(CoreController):
             },
         )
 
+    def _get_oidc_link_cors_headers(self, request: web.Request) -> dict[str, str]:
+        """Return credentialed CORS headers for a trusted OIDC linking origin."""
+        origin = request.headers.get("Origin")
+        if not origin or origin == "null":
+            return {}
+
+        parsed_origin = urlparse(origin)
+        if (
+            parsed_origin.scheme not in ("http", "https")
+            or not parsed_origin.netloc
+            or parsed_origin.username
+            or parsed_origin.password
+            or parsed_origin.path
+            or parsed_origin.params
+            or parsed_origin.query
+            or parsed_origin.fragment
+        ):
+            return {}
+
+        normalized_origin = _url_origin(origin)
+        trusted_origins = {APP_MA_HOST}
+        for configured_url in (self.base_url, self.external_url):
+            if configured_url:
+                trusted_origins.add(_url_origin(configured_url))
+
+        if normalized_origin not in trusted_origins:
+            hostname = parsed_origin.hostname
+            if not hostname:
+                return {}
+            if hostname not in ("localhost", "127.0.0.1", "::1"):
+                try:
+                    if not ipaddress.ip_address(hostname).is_private:
+                        return {}
+                except ValueError:
+                    # The fixed Home Assistant origins are safe development/client origins.
+                    if normalized_origin not in (
+                        "https://my.home-assistant.io",
+                        "http://homeassistant.local",
+                        "https://homeassistant.local",
+                    ):
+                        return {}
+
+        return {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Vary": "Origin",
+        }
+
+    def _with_oidc_link_cors(self, request: web.Request, response: web.Response) -> web.Response:
+        """Add credentialed CORS headers when an OIDC link request has a trusted origin."""
+        response.headers.update(self._get_oidc_link_cors_headers(request))
+        return response
+
+    async def _handle_oidc_link_start_preflight(self, request: web.Request) -> web.Response:
+        """Handle the credentialed browser preflight for OIDC account linking."""
+        headers = self._get_oidc_link_cors_headers(request)
+        if not headers:
+            return web.Response(status=403)
+        headers.update(
+            {
+                "Access-Control-Allow-Methods": "POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Max-Age": "86400",
+            }
+        )
+        return web.Response(status=204, headers=headers)
+
     async def _handle_server_info(self, request: web.Request) -> web.Response:
         """Handle request for server info."""
         server_info = self.mass.get_server_info()
@@ -1314,27 +1382,43 @@ class WebserverController(CoreController):
         try:
             parts = request.headers.get("Authorization", "").split(" ", 1)
             if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1]:
-                return web.Response(status=401, text="Not authenticated")
+                return self._with_oidc_link_cors(
+                    request, web.Response(status=401, text="Not authenticated")
+                )
             session_token = parts[1]
             user = await get_authenticated_user(request)
             if not user:
-                return web.Response(status=401, text="Not authenticated")
+                return self._with_oidc_link_cors(
+                    request, web.Response(status=401, text="Not authenticated")
+                )
             if not has_scope(user, Scope.CONFIG_PROVIDERS_OWN):
-                return web.Response(status=403, text="Not permitted to manage this account")
+                return self._with_oidc_link_cors(
+                    request, web.Response(status=403, text="Not permitted to manage this account")
+                )
             try:
                 data = await request.json()
             except json.JSONDecodeError, web.HTTPBadRequest:
-                return web.Response(status=400, text="Invalid request")
+                return self._with_oidc_link_cors(
+                    request, web.Response(status=400, text="Invalid request")
+                )
             if not isinstance(data, dict) or data.get("confirmed") is not True:
-                return web.Response(status=400, text="Explicit confirmation is required")
+                return self._with_oidc_link_cors(
+                    request,
+                    web.Response(status=400, text="Explicit confirmation is required"),
+                )
 
             started = await self.auth.start_oidc_link(user, session_token)
             if not started:
-                return web.Response(status=400, text="OIDC is not configured")
+                return self._with_oidc_link_cors(
+                    request, web.Response(status=400, text="OIDC is not configured")
+                )
             authorization_url, pending, callback_binding = started
             cookie_name = oidc_link_cookie_name(pending.state)
             if cookie_name is None:
-                return web.Response(status=500, text="Account linking could not be started")
+                return self._with_oidc_link_cors(
+                    request,
+                    web.Response(status=500, text="Account linking could not be started"),
+                )
             provider = self.auth.login_providers.get("oidc")
             secure = bool(
                 isinstance(provider, OIDCLoginProvider)
@@ -1351,16 +1435,26 @@ class WebserverController(CoreController):
                 samesite="Lax",
                 path="/auth/callback",
             )
-            return response
+            return self._with_oidc_link_cors(request, response)
         except AuthenticationRequired:
-            return web.Response(status=401, text="Not authenticated")
+            return self._with_oidc_link_cors(
+                request, web.Response(status=401, text="Not authenticated")
+            )
         except InsufficientPermissions:
-            return web.Response(status=403, text="Not permitted to manage this account")
+            return self._with_oidc_link_cors(
+                request, web.Response(status=403, text="Not permitted to manage this account")
+            )
         except RateLimited:
-            return web.Response(status=429, text="Too many sign-ins are pending, try again later")
+            return self._with_oidc_link_cors(
+                request,
+                web.Response(status=429, text="Too many sign-ins are pending, try again later"),
+            )
         except Exception:
             self.logger.exception("Error starting OIDC account linking")
-            return web.json_response({"error": "Account linking could not be started"}, status=500)
+            return self._with_oidc_link_cors(
+                request,
+                web.json_response({"error": "Account linking could not be started"}, status=500),
+            )
 
     async def _handle_auth_callback(self, request: web.Request) -> web.Response:
         """Handle OAuth callback."""

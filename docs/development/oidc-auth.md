@@ -90,6 +90,13 @@ fixed callback uses HTTPS. Pending server state stores hashes of the cookie valu
 token, along with the initiating user ID; it does not expose the binding or PKCE verifier in the
 response. Link callbacks are browser-only and must return to the fixed OIDC callback URI.
 
+The link-start HTTP route supports credentialed browser CORS for the Music Assistant Remote
+Access origin, the configured `base_url` and `external_url`, loopback and private-network origins,
+and the fixed Home Assistant origins used by local clients. It echoes only a trusted requesting
+origin, includes `Access-Control-Allow-Credentials`, and rejects untrusted preflights. The short-
+lived callback cookie can still be affected by browser third-party-cookie restrictions when the
+frontend and server are on different sites.
+
 The WebSocket/API commands are:
 
 | Command | Scope | Purpose |
