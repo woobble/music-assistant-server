@@ -48,6 +48,7 @@ class PendingLogin:
     redirect_target: RedirectTarget
     expires_at: float  # monotonic
     idp_code_verifier: str
+    oidc_nonce: str | None = None
     return_url: str | None = None
     client_code_challenge: str | None = None  # S256 only
 
@@ -98,6 +99,7 @@ class PendingLoginStore:
             redirect_target=redirect_target,
             expires_at=now + PENDING_LOGIN_TTL,
             idp_code_verifier=idp_code_verifier,
+            oidc_nonce=secrets.token_urlsafe(32),
             return_url=return_url,
             client_code_challenge=client_code_challenge,
         )

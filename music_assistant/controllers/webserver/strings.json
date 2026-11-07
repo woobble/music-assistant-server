@@ -8,6 +8,22 @@
       "label": "Allow User Self-Registration",
       "description": "Allow users to create accounts via Home Assistant OAuth."
     },
+    "auth_oidc_issuer": {
+      "label": "OpenID Connect issuer",
+      "description": "The exact issuer URL advertised by the identity provider's discovery document. HTTPS is required except for loopback addresses used in local testing."
+    },
+    "auth_oidc_client_id": {
+      "label": "OpenID Connect client ID",
+      "description": "The client ID registered with the identity provider for Music Assistant's callback URL."
+    },
+    "auth_oidc_client_secret": {
+      "label": "OpenID Connect client secret",
+      "description": "The confidential client secret registered with the identity provider. It is stored as a secure string and is never returned in public configuration."
+    },
+    "auth_oidc_scopes": {
+      "label": "OpenID Connect scopes",
+      "description": "Space-separated OIDC scopes. Only openid, profile and email are accepted. Sign-in is limited to existing linked accounts; new-user registration and account linking are deferred."
+    },
     "base_url": {
       "label": "Internal URL",
       "description": "The URL that Music Assistant shares with devices and apps on your local network. \nSet it yourself when the automatically detected address does not work for them, for example behind a reverse proxy, with a custom hostname or on a server connected to more than one network."

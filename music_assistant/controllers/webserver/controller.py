@@ -50,6 +50,10 @@ from yarl import URL
 from music_assistant.constants import (
     APP_MA_HOST,
     CONF_AUTH_ALLOW_SELF_REGISTRATION,
+    CONF_AUTH_OIDC_CLIENT_ID,
+    CONF_AUTH_OIDC_CLIENT_SECRET,
+    CONF_AUTH_OIDC_ISSUER,
+    CONF_AUTH_OIDC_SCOPES,
     CONF_BIND_IP,
     CONF_BIND_PORT,
     CONF_VALUE_AUTO,
@@ -96,6 +100,11 @@ from .helpers.auth_middleware import (
 )
 from .helpers.auth_providers import BuiltinLoginProvider, get_ha_user_role
 from .helpers.login_flow import AuthTransport, RedirectTarget
+from .helpers.oidc_provider import (
+    is_valid_oidc_client_id_config,
+    is_valid_oidc_issuer_config,
+    is_valid_oidc_scopes,
+)
 from .remote_access import RemoteAccessManager
 from .sendspin_proxy import SendspinProxyHandler
 from .websocket_client import WebsocketClientHandler
@@ -696,6 +705,40 @@ class WebserverController(CoreController):
                 requires_reload=False,
             ),
             ConfigEntry(
+                key=CONF_AUTH_OIDC_ISSUER,
+                type=ConfigEntryType.STRING,
+                required=False,
+                advanced=True,
+                requires_reload=True,
+                validate=is_valid_oidc_issuer_config,
+            ),
+            ConfigEntry(
+                key=CONF_AUTH_OIDC_CLIENT_ID,
+                type=ConfigEntryType.STRING,
+                required=False,
+                advanced=True,
+                depends_on=CONF_AUTH_OIDC_ISSUER,
+                requires_reload=True,
+                validate=is_valid_oidc_client_id_config,
+            ),
+            ConfigEntry(
+                key=CONF_AUTH_OIDC_CLIENT_SECRET,
+                type=ConfigEntryType.SECURE_STRING,
+                required=False,
+                advanced=True,
+                depends_on=CONF_AUTH_OIDC_ISSUER,
+                requires_reload=True,
+            ),
+            ConfigEntry(
+                key=CONF_AUTH_OIDC_SCOPES,
+                type=ConfigEntryType.STRING,
+                default_value="openid profile email",
+                advanced=True,
+                depends_on=CONF_AUTH_OIDC_ISSUER,
+                requires_reload=True,
+                validate=is_valid_oidc_scopes,
+            ),
+            ConfigEntry(
                 key="webserver_warn",
                 type=ConfigEntryType.ALERT,
                 required=False,
@@ -1235,11 +1278,19 @@ class WebserverController(CoreController):
             code = request.query.get("code")
             state = request.query.get("state")
             provider_id = request.query.get("provider_id")
+            error = request.query.get("error")
 
-            if not code or not state or not provider_id:
-                return web.Response(status=400, text="code, state, and provider_id required")
+            if not state or not provider_id:
+                return web.Response(status=400, text="state and provider_id required")
+            if any(
+                len(request.query.getall(key, [])) != 1 for key in ("state", "provider_id")
+            ) or any(len(request.query.getall(key, [])) > 1 for key in ("code", "error")):
+                return web.Response(status=400, text="Invalid OAuth callback")
 
-            auth_result = await self.auth.handle_oauth_callback(provider_id, code, state)
+            if error is None:
+                auth_result = await self.auth.handle_oauth_callback(provider_id, code, state)
+            else:
+                auth_result = await self.auth.handle_oauth_callback(provider_id, code, state, error)
 
             if not auth_result.success or not auth_result.user:
                 # Return error page

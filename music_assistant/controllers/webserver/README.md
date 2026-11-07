@@ -59,6 +59,7 @@ Handles all authentication and user management:
 **Authentication Providers:**
 - **Built-in Provider** - Username/password authentication with PBKDF2-HMAC-SHA256 hashing
 - **Home Assistant OAuth** - OAuth2 flow for Home Assistant users (auto-enabled when HA provider is configured)
+- **OpenID Connect** - Generic Authorization Code + PKCE flow for one configured issuer; accepts linked enabled users only
 
 **Token Types:**
 - **Short-lived tokens**: Auto-renewing on use, 30-day sliding expiration window capped at 90 days from creation (for user sessions)
@@ -156,6 +157,7 @@ Manages individual WebSocket connections:
 - Base classes for authentication providers
 - Built-in username/password provider
 - Home Assistant OAuth provider
+- Generic OIDC provider ([helpers/oidc_provider.py](helpers/oidc_provider.py))
 - Rate limiting implementation
 
 **Sign-in flow ([helpers/login_flow.py](helpers/login_flow.py)):**
@@ -219,6 +221,21 @@ Manages individual WebSocket connections:
    its opener (an `oauth_success` message) and closes; otherwise the page navigates to
    `return_url` (`/` when none or an invalid one was given), where the client reads the token
    from the `code` parameter
+
+### Login Flow (OpenID Connect)
+
+The generic OIDC provider is enabled when its issuer, client ID and secure client secret are
+configured in the webserver settings. It uses the configured external URL, or the base URL when
+no external URL is set, for its fixed registered `/auth/callback?provider_id=oidc` URI. It uses
+Authorization Code + S256 PKCE, and keeps state, nonce and the IdP verifier in the server-side
+pending sign-in record. Discovery, token, UserInfo and JWKS requests use the configured issuer.
+
+The server validates the ID token with PyJWT and the issuer JWKS, then requires UserInfo's `sub`
+to match. The `(issuer, sub)` pair resolves only an existing `oidc` provider link; unlinked or
+disabled users are refused, and OIDC profile or role claims do not change the MA account. OIDC
+self-registration and Remote Access app sign-in are not enabled yet. See
+[the OIDC implementation notes](../../../docs/development/oidc-auth.md) for configuration,
+security checks and remaining frontend work.
 
 ### Login Flow (Home Assistant OAuth, remote app)
 

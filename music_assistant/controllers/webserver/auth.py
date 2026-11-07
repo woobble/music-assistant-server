@@ -32,6 +32,10 @@ from music_assistant_models.errors import (
 )
 
 from music_assistant.constants import (
+    CONF_AUTH_OIDC_CLIENT_ID,
+    CONF_AUTH_OIDC_CLIENT_SECRET,
+    CONF_AUTH_OIDC_ISSUER,
+    CONF_AUTH_OIDC_SCOPES,
     CONF_PLAYERS,
     DB_TABLE_BOOKMARKS,
     DB_TABLE_MEDIA_PROGRESS,
@@ -68,6 +72,13 @@ from music_assistant.controllers.webserver.helpers.login_flow import (
     PendingLoginStore,
     RedirectTarget,
     verify_pkce,
+)
+from music_assistant.controllers.webserver.helpers.oidc_provider import (
+    OIDCLoginProvider,
+    OIDCProviderConfig,
+    is_valid_oidc_client_id,
+    is_valid_oidc_issuer_url,
+    is_valid_oidc_scopes,
 )
 from music_assistant.helpers.api import api_command
 from music_assistant.helpers.database import DatabaseConnection
@@ -1204,12 +1215,15 @@ class AuthenticationManager:
         if not provider or not provider.requires_redirect:
             return None
 
-        callback_base_url = self.webserver.get_auth_callback_base(
-            transport,
-            redirect_target=redirect_target,
-            return_url=return_url,
-            request_host=request_host,
-        )
+        if isinstance(provider, OIDCLoginProvider):
+            callback_base_url = provider.fixed_callback_base_url
+        else:
+            callback_base_url = self.webserver.get_auth_callback_base(
+                transport,
+                redirect_target=redirect_target,
+                return_url=return_url,
+                request_host=request_host,
+            )
         if transport is AuthTransport.REMOTE and redirect_target == "app":
             # the provider is found from the state, as the app callback serves every provider
             redirect_uri = f"{callback_base_url}/auth/callback/"
@@ -1232,22 +1246,33 @@ class AuthenticationManager:
                 self.pending_logins.pop(pending.state)
         return (auth_url, pending) if auth_url else None
 
-    async def handle_oauth_callback(self, provider_id: str, code: str, state: str) -> AuthResult:
+    async def handle_oauth_callback(
+        self, provider_id: str, code: str | None, state: str, error: str | None = None
+    ) -> AuthResult:
         """
         Handle OAuth callback.
 
         :param provider_id: The provider ID.
-        :param code: OAuth authorization code.
+        :param code: OAuth authorization code, if the issuer granted access.
         :param state: OAuth state parameter.
+        :param error: OAuth error code, if the issuer denied or cancelled sign-in.
         """
-        provider = self.login_providers.get(provider_id)
-        if not provider:
-            return AuthResult(success=False, error="Invalid provider")
-
         pending = self.pending_logins.pop(state)
         # a sign-in that returns to the app is completed by the app itself (auth/exchange)
         if not pending or pending.provider_id != provider_id or pending.redirect_target != "server":
             return AuthResult(success=False, error="Invalid or expired state parameter")
+        provider = self.login_providers.get(provider_id)
+        if not provider:
+            return AuthResult(success=False, error="Invalid provider")
+        if error:
+            message = (
+                "Sign-in was cancelled"
+                if error == "access_denied"
+                else "The identity provider rejected the sign-in"
+            )
+            return AuthResult(success=False, error=message)
+        if not code:
+            return AuthResult(success=False, error="No authorization code received")
         if not AUTH_CODE_RE.fullmatch(code):
             return AuthResult(success=False, error="Invalid authorization code")
         try:
@@ -2277,6 +2302,38 @@ class AuthenticationManager:
         """Set up available login providers based on configuration."""
         # Always enable built-in provider
         self.login_providers["builtin"] = BuiltinLoginProvider(self.mass, "builtin", {})
+
+        webserver_config = getattr(self.webserver, "config", None)
+        if webserver_config is None:
+            issuer = client_id = client_secret = ""
+            scopes = "openid profile email"
+        else:
+            issuer = webserver_config.get_value(CONF_AUTH_OIDC_ISSUER, "")
+            client_id = webserver_config.get_value(CONF_AUTH_OIDC_CLIENT_ID, "")
+            client_secret = webserver_config.get_value(CONF_AUTH_OIDC_CLIENT_SECRET, "")
+            scopes = webserver_config.get_value(CONF_AUTH_OIDC_SCOPES, "openid profile email")
+        oidc_configured = bool(issuer or client_id or client_secret)
+        if oidc_configured:
+            if (
+                isinstance(issuer, str)
+                and isinstance(client_id, str)
+                and isinstance(client_secret, str)
+                and isinstance(scopes, str)
+                and is_valid_oidc_issuer_url(issuer)
+                and is_valid_oidc_client_id(client_id)
+                and 0 < len(client_secret) <= 4096
+                and is_valid_oidc_scopes(scopes)
+            ):
+                oidc_config: OIDCProviderConfig = {
+                    "issuer": issuer,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "scopes": scopes,
+                }
+                self.login_providers["oidc"] = OIDCLoginProvider(self.mass, "oidc", oidc_config)
+                self.logger.info("Generic OIDC login provider enabled")
+            else:
+                self.logger.warning("OIDC login is disabled because its configuration is invalid")
 
         # Home Assistant OAuth provider
         # Automatically enabled if HA provider (plugin) is configured

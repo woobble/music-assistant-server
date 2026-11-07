@@ -78,6 +78,8 @@ def test_state_prefix_follows_the_return_url(return_url: str | None, prefix: str
 
     assert pending.state.startswith(prefix)
     assert len(pending.state) > 40
+    assert pending.oidc_nonce
+    assert pending.oidc_nonce != pending.state
 
 
 def test_a_pending_sign_in_is_used_once() -> None:

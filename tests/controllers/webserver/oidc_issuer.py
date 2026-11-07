@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any, Self
@@ -28,10 +29,28 @@ class MockOIDCIssuer:
     def __init__(self) -> None:
         """Create an issuer with a fresh signing key and no network listener."""
         self._private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self._active_kid = MOCK_KID
+        self.id_token_signing_key: Any = None
+        self.id_token_algorithm = "RS256"
+        self.id_token_claim_overrides: dict[str, Any] = {}
         self._codes: dict[str, dict[str, str]] = {}
         self.authorization_requests: list[dict[str, str]] = []
         self.authorization_error: str | None = None
         self.authorization_error_description: str | None = None
+        self.discovery_overrides: dict[str, Any] = {}
+        self.discovery_status = 200
+        self.discovery_delay = 0.0
+        self.discovery_requests = 0
+        self.token_status = 200
+        self.token_delay = 0.0
+        self.token_requests = 0
+        self.token_auth_methods = ["client_secret_basic"]
+        self.jwks_status = 200
+        self.jwks_requests = 0
+        self.userinfo_status = 200
+        self.userinfo_subject = MOCK_SUBJECT
+        self.userinfo_overrides: dict[str, Any] = {}
+        self.userinfo_requests = 0
         self.issuer = ""
         self.app = web.Application()
         self.app.router.add_get("/.well-known/openid-configuration", self._discovery)
@@ -60,25 +79,35 @@ class MockOIDCIssuer:
     def public_jwk(self) -> dict[str, Any]:
         """Return the public signing key in JWK form."""
         jwk = jwt.algorithms.RSAAlgorithm.to_jwk(self._private_key.public_key(), as_dict=True)
-        jwk.update({"kid": MOCK_KID, "use": "sig", "alg": "RS256"})
+        jwk.update({"kid": self._active_kid, "use": "sig", "alg": "RS256"})
         return jwk
+
+    def rotate_signing_key(self, kid: str = "mock-rsa-key-rotated") -> None:
+        """Replace the issuer's active signing key and key ID."""
+        self._private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self._active_kid = kid
 
     async def _discovery(self, _request: web.Request) -> web.Response:
         """Return metadata for an authorization-code OIDC client."""
-        return web.json_response(
-            {
-                "issuer": self.issuer,
-                "authorization_endpoint": f"{self.issuer}/authorize",
-                "token_endpoint": f"{self.issuer}/token",
-                "jwks_uri": f"{self.issuer}/jwks",
-                "userinfo_endpoint": f"{self.issuer}/userinfo",
-                "response_types_supported": ["code"],
-                "subject_types_supported": ["public"],
-                "id_token_signing_alg_values_supported": ["RS256"],
-                "grant_types_supported": ["authorization_code"],
-                "token_endpoint_auth_methods_supported": ["client_secret_basic"],
-            }
-        )
+        self.discovery_requests += 1
+        if self.discovery_delay:
+            await asyncio.sleep(self.discovery_delay)
+        if self.discovery_status != 200:
+            return web.json_response({"error": "unavailable"}, status=self.discovery_status)
+        metadata: dict[str, Any] = {
+            "issuer": self.issuer,
+            "authorization_endpoint": f"{self.issuer}/authorize",
+            "token_endpoint": f"{self.issuer}/token",
+            "jwks_uri": f"{self.issuer}/jwks",
+            "userinfo_endpoint": f"{self.issuer}/userinfo",
+            "response_types_supported": ["code"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["RS256"],
+            "grant_types_supported": ["authorization_code"],
+            "token_endpoint_auth_methods_supported": self.token_auth_methods,
+        }
+        metadata.update(self.discovery_overrides)
+        return web.json_response(metadata)
 
     async def _authorize(self, request: web.Request) -> web.Response:
         """Record an authorization request and redirect with code/state or an OAuth error."""
@@ -121,11 +150,22 @@ class MockOIDCIssuer:
 
     async def _token(self, request: web.Request) -> web.Response:
         """Check the client, code, redirect URI, and PKCE verifier before issuing tokens."""
-        expected_auth = self.client_authorization
-        if request.headers.get("Authorization") != expected_auth:
-            return web.json_response({"error": "invalid_client"}, status=401)
-
+        self.token_requests += 1
+        if self.token_delay:
+            await asyncio.sleep(self.token_delay)
+        if self.token_status != 200:
+            return web.json_response({"error": "unavailable"}, status=self.token_status)
         form = await request.post()
+        authenticated = (
+            "client_secret_basic" in self.token_auth_methods
+            and request.headers.get("Authorization") == self.client_authorization
+        ) or (
+            "client_secret_post" in self.token_auth_methods
+            and form.get("client_id") == MOCK_CLIENT_ID
+            and form.get("client_secret") == MOCK_CLIENT_SECRET
+        )
+        if not authenticated:
+            return web.json_response({"error": "invalid_client"}, status=401)
         code = str(form.get("code", ""))
         code_data = self._codes.get(code)
         if (
@@ -139,22 +179,28 @@ class MockOIDCIssuer:
 
         del self._codes[code]
         now = datetime.now(UTC)
+        claims: dict[str, Any] = {
+            "iss": self.issuer,
+            "sub": MOCK_SUBJECT,
+            "aud": MOCK_CLIENT_ID,
+            "iat": int(now.timestamp()),
+            "exp": int((now + timedelta(minutes=5)).timestamp()),
+            "nonce": code_data["nonce"],
+            "email": "listener@example.test",
+            "email_verified": True,
+            "preferred_username": "mock-listener",
+            "name": "Mock Listener",
+        }
+        for key, value in self.id_token_claim_overrides.items():
+            if value is None:
+                claims.pop(key, None)
+            else:
+                claims[key] = value
         id_token = jwt.encode(
-            {
-                "iss": self.issuer,
-                "sub": MOCK_SUBJECT,
-                "aud": MOCK_CLIENT_ID,
-                "iat": int(now.timestamp()),
-                "exp": int((now + timedelta(minutes=5)).timestamp()),
-                "nonce": code_data["nonce"],
-                "email": "listener@example.test",
-                "email_verified": True,
-                "preferred_username": "mock-listener",
-                "name": "Mock Listener",
-            },
-            self._private_key,
-            algorithm="RS256",
-            headers={"kid": MOCK_KID},
+            claims,
+            self.id_token_signing_key or self._private_key,
+            algorithm=self.id_token_algorithm,
+            headers={"kid": self._active_kid},
         )
         return web.json_response(
             {
@@ -167,18 +213,24 @@ class MockOIDCIssuer:
 
     async def _jwks(self, _request: web.Request) -> web.Response:
         """Return the public signing key only."""
+        self.jwks_requests += 1
+        if self.jwks_status != 200:
+            return web.json_response({"error": "unavailable"}, status=self.jwks_status)
         return web.json_response({"keys": [self.public_jwk]})
 
     async def _userinfo(self, request: web.Request) -> web.Response:
         """Return claims for the mock access token."""
+        self.userinfo_requests += 1
+        if self.userinfo_status != 200:
+            return web.json_response({"error": "unavailable"}, status=self.userinfo_status)
         if request.headers.get("Authorization") != f"Bearer {MOCK_ACCESS_TOKEN}":
             return web.json_response({"error": "invalid_token"}, status=401)
-        return web.json_response(
-            {
-                "sub": MOCK_SUBJECT,
-                "email": "listener@example.test",
-                "email_verified": True,
-                "preferred_username": "mock-listener",
-                "name": "Mock Listener",
-            }
-        )
+        userinfo: dict[str, Any] = {
+            "sub": self.userinfo_subject,
+            "email": "listener@example.test",
+            "email_verified": True,
+            "preferred_username": "mock-listener",
+            "name": "Mock Listener",
+        }
+        userinfo.update(self.userinfo_overrides)
+        return web.json_response(userinfo)

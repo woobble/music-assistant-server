@@ -19,4 +19,19 @@ if [[ -z "${UV_PROJECT_ENVIRONMENT:-}" && -n "$common_dir" && "$git_dir" != "$co
   fi
 fi
 
+# Keep an explicitly editable shared models checkout available to development tools. This is
+# useful when the server depends on a models change that has not been released yet.
+if [[ -z "${UV_NO_SYNC:-}" ]]; then
+  project_venv="${UV_PROJECT_ENVIRONMENT:-.venv}"
+  for direct_url in \
+    "$project_venv"/lib/python*/site-packages/music_assistant_models-*.dist-info/direct_url.json
+  do
+    [[ -f "$direct_url" ]] || continue
+    if grep -Eq '"editable"[[:space:]]*:[[:space:]]*true' "$direct_url"; then
+      export UV_NO_SYNC=1
+      break
+    fi
+  done
+fi
+
 exec uv run "$@"
