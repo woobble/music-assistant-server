@@ -1212,6 +1212,8 @@
     }
   },
   "errors": {
+    "auth_provider_link_conflict": "This authentication identity is already linked to another account.",
+    "auth_provider_link_failed": "The authentication provider could not be linked.",
     "setup_required": "Music Assistant is not set up yet.",
     "provider_unavailable": "The provider is currently unavailable.",
     "media_not_found": "The requested media item could not be found.",
@@ -1225,6 +1227,7 @@
     "role_can_not_own_music_sources": "This role can not own a music source.",
     "system_user_protected": "The Home Assistant system account can not be deleted, disabled, renamed or given another role or password.",
     "last_admin": "This is the last administrator. Make another user an administrator first.",
+    "last_auth_provider": "At least one usable login method must remain on the account.",
     "username_taken": "This username is already in use.",
     "username_too_short": "Username must be at least {0} characters.",
     "sign_in_expired": "This sign-in has expired or was already used. Please sign in again.",

@@ -28,7 +28,7 @@ from aiohttp import web
 from mashumaro.exceptions import MissingField
 from music_assistant_frontend import where as locate_frontend
 from music_assistant_models.api import CommandMessage
-from music_assistant_models.auth import UserRole
+from music_assistant_models.auth import Scope, UserRole
 from music_assistant_models.config_entries import (
     ConfigActionResult,
     ConfigEntry,
@@ -37,6 +37,7 @@ from music_assistant_models.config_entries import (
 )
 from music_assistant_models.enums import ConfigEntryType, EventType
 from music_assistant_models.errors import (
+    AuthenticationRequired,
     InsufficientPermissions,
     InvalidDataError,
     PlayerUnavailableError,
@@ -50,6 +51,7 @@ from yarl import URL
 from music_assistant.constants import (
     APP_MA_HOST,
     CONF_AUTH_ALLOW_SELF_REGISTRATION,
+    CONF_AUTH_OIDC_ALLOW_REGISTRATION,
     CONF_AUTH_OIDC_CLIENT_ID,
     CONF_AUTH_OIDC_CLIENT_SECRET,
     CONF_AUTH_OIDC_ISSUER,
@@ -87,7 +89,7 @@ from music_assistant.helpers.webserver import Webserver
 from music_assistant.models.core_controller import CoreController
 
 from .api_docs import generate_commands_json, generate_openapi_spec, generate_schemas_json
-from .auth import AuthenticationManager
+from .auth import AuthenticationManager, oidc_link_cookie_name
 from .helpers.auth_middleware import (
     get_authenticated_user,
     has_scope,
@@ -98,9 +100,10 @@ from .helpers.auth_middleware import (
     set_current_user,
     set_impersonated_user,
 )
-from .helpers.auth_providers import BuiltinLoginProvider, get_ha_user_role
+from .helpers.auth_providers import AuthResult, BuiltinLoginProvider, get_ha_user_role
 from .helpers.login_flow import AuthTransport, RedirectTarget
 from .helpers.oidc_provider import (
+    OIDCLoginProvider,
     is_valid_oidc_client_id_config,
     is_valid_oidc_issuer_config,
     is_valid_oidc_scopes,
@@ -402,6 +405,8 @@ class WebserverController(CoreController):
         routes.append(("GET", "/auth/me", self._handle_auth_me))
         routes.append(("GET", "/auth/providers", self._handle_auth_providers))
         routes.append(("GET", "/auth/authorize", self._handle_auth_authorize))
+        routes.append(("POST", "/auth/oidc/link/start", self._handle_oidc_link_start))
+        routes.append(("OPTIONS", "/auth/oidc/link/start", self._handle_cors_preflight))
         routes.append(("GET", "/auth/callback", self._handle_auth_callback))
         # add first-time setup routes
         routes.append(("GET", "/setup", self._handle_setup_page))
@@ -762,6 +767,13 @@ class WebserverController(CoreController):
                 depends_on=CONF_AUTH_OIDC_ISSUER,
                 requires_reload=True,
                 validate=is_valid_oidc_scopes,
+            ),
+            ConfigEntry(
+                key=CONF_AUTH_OIDC_ALLOW_REGISTRATION,
+                type=ConfigEntryType.BOOLEAN,
+                default_value=False,
+                advanced=True,
+                requires_reload=False,
             ),
             ConfigEntry(
                 key="webserver_warn",
@@ -1297,87 +1309,175 @@ class WebserverController(CoreController):
             self.logger.exception("Error during OAuth authorization")
             return web.json_response({"error": "Authorization failed"}, status=500)
 
+    async def _handle_oidc_link_start(self, request: web.Request) -> web.Response:
+        """Start a confirmed OIDC account-linking transaction for the current user."""
+        try:
+            parts = request.headers.get("Authorization", "").split(" ", 1)
+            if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1]:
+                return web.Response(status=401, text="Not authenticated")
+            session_token = parts[1]
+            user = await get_authenticated_user(request)
+            if not user:
+                return web.Response(status=401, text="Not authenticated")
+            if not has_scope(user, Scope.CONFIG_PROVIDERS_OWN):
+                return web.Response(status=403, text="Not permitted to manage this account")
+            try:
+                data = await request.json()
+            except json.JSONDecodeError, web.HTTPBadRequest:
+                return web.Response(status=400, text="Invalid request")
+            if not isinstance(data, dict) or data.get("confirmed") is not True:
+                return web.Response(status=400, text="Explicit confirmation is required")
+
+            started = await self.auth.start_oidc_link(user, session_token)
+            if not started:
+                return web.Response(status=400, text="OIDC is not configured")
+            authorization_url, pending, callback_binding = started
+            cookie_name = oidc_link_cookie_name(pending.state)
+            if cookie_name is None:
+                return web.Response(status=500, text="Account linking could not be started")
+            provider = self.auth.login_providers.get("oidc")
+            secure = bool(
+                isinstance(provider, OIDCLoginProvider)
+                and provider.fixed_callback_base_url.startswith("https://")
+            )
+            response = web.json_response({"authorization_url": authorization_url})
+            response.headers["Cache-Control"] = "no-store"
+            response.set_cookie(
+                cookie_name,
+                callback_binding,
+                max_age=600,
+                httponly=True,
+                secure=secure,
+                samesite="Lax",
+                path="/auth/callback",
+            )
+            return response
+        except AuthenticationRequired:
+            return web.Response(status=401, text="Not authenticated")
+        except InsufficientPermissions:
+            return web.Response(status=403, text="Not permitted to manage this account")
+        except RateLimited:
+            return web.Response(status=429, text="Too many sign-ins are pending, try again later")
+        except Exception:
+            self.logger.exception("Error starting OIDC account linking")
+            return web.json_response({"error": "Account linking could not be started"}, status=500)
+
     async def _handle_auth_callback(self, request: web.Request) -> web.Response:
         """Handle OAuth callback."""
+        state = request.query.get("state")
+        link_cookie_name = oidc_link_cookie_name(state) if state else None
+        provider = self.auth.login_providers.get("oidc")
+        secure_link_cookie = bool(
+            isinstance(provider, OIDCLoginProvider)
+            and provider.fixed_callback_base_url.startswith("https://")
+        )
         try:
             code = request.query.get("code")
-            state = request.query.get("state")
             provider_id = request.query.get("provider_id")
             error = request.query.get("error")
-
             if not state or not provider_id:
-                return web.Response(status=400, text="state and provider_id required")
-            if any(
+                response = web.Response(status=400, text="state and provider_id required")
+            elif any(
                 len(request.query.getall(key, [])) != 1 for key in ("state", "provider_id")
             ) or any(len(request.query.getall(key, [])) > 1 for key in ("code", "error")):
-                return web.Response(status=400, text="Invalid OAuth callback")
-
-            if error is None:
-                auth_result = await self.auth.handle_oauth_callback(provider_id, code, state)
+                response = web.Response(status=400, text="Invalid OAuth callback")
             else:
-                auth_result = await self.auth.handle_oauth_callback(provider_id, code, state, error)
-
-            if not auth_result.success or not auth_result.user:
-                # Return error page
-                error_html = f"""
-                <html>
-                <body>
-                    <h1>Authentication Failed</h1>
-                    <p>{html.escape(auth_result.error or "Unknown error")}</p>
-                    <a href="/login">Back to Login</a>
-                </body>
-                </html>
-                """
-                return web.Response(text=error_html, content_type="text/html", status=400)
-
-            # Create token
-            device_name = f"OAuth ({provider_id})"
-            token = await self.auth.create_token(auth_result.user, device_name)
-
-            # Determine redirect URL (use return_url from OAuth flow or default to root)
-            final_redirect_url = auth_result.return_url or "/"
-            requires_consent = False
-
-            # Validate redirect URL for security
-            if auth_result.return_url:
-                is_valid, category = is_allowed_redirect_url(
-                    auth_result.return_url, request, self.base_url, self.external_url
+                auth_result = await self._get_oauth_callback_result(
+                    request, provider_id, code, state, error, link_cookie_name
                 )
-                if not is_valid:
-                    self.logger.warning("Invalid return_url blocked: %s", auth_result.return_url)
-                    final_redirect_url = "/"
-                elif category == "external":
-                    # External domain - require user consent
-                    requires_consent = True
-            final_redirect_url = build_code_redirect_url(final_redirect_url, token)
-
-            # Load OAuth callback success page template and inject token and redirect URL
-            oauth_callback_html_path = str(RESOURCES_DIR.joinpath("oauth_callback.html"))
-            async with aiofiles.open(oauth_callback_html_path) as f:
-                success_html = await f.read()
-
-            # Replace the redirect last so its untrusted contents cannot match another placeholder.
-            success_html = success_html.replace(
-                "{REQUIRES_CONSENT}", "true" if requires_consent else "false"
-            )
-            success_html = success_html.replace("{TOKEN}", _serialize_script_value(token))
-            success_html = success_html.replace(
-                "{REDIRECT_URL}", _serialize_script_value(final_redirect_url)
-            )
-
-            return web.Response(text=success_html, content_type="text/html")
+                response = await self._render_oauth_callback_result(
+                    request, provider_id, auth_result
+                )
         except Exception:
             self.logger.exception("Error during OAuth callback")
-            error_html = """
-            <html>
-            <body>
-                <h1>Authentication Failed</h1>
-                <p>An error occurred during authentication</p>
-                <a href="/login">Back to Login</a>
-            </body>
-            </html>
+            response = web.Response(
+                text=_oauth_callback_error_html("An error occurred during authentication"),
+                content_type="text/html",
+                status=500,
+            )
+        if response.content_type == "text/html":
+            response.headers["Cache-Control"] = "no-store"
+        return self._clear_link_cookie(response, link_cookie_name, secure_link_cookie)
+
+    async def _get_oauth_callback_result(
+        self,
+        request: web.Request,
+        provider_id: str,
+        code: str | None,
+        state: str,
+        error: str | None,
+        link_cookie_name: str | None,
+    ) -> AuthResult:
+        """Complete the pending OAuth callback using its matching transaction intent."""
+        if link_cookie_name:
+            return await self.auth.handle_oauth_callback(
+                provider_id,
+                code,
+                state,
+                error,
+                link_callback_binding=request.cookies.get(link_cookie_name),
+            )
+        if error is None:
+            return await self.auth.handle_oauth_callback(provider_id, code, state)
+        return await self.auth.handle_oauth_callback(provider_id, code, state, error)
+
+    async def _render_oauth_callback_result(
+        self, request: web.Request, provider_id: str, auth_result: AuthResult
+    ) -> web.Response:
+        """Render a safe success page for a completed login or account link."""
+        if auth_result.success and auth_result.linked:
+            linked_html = """
+            <html><body><h1>Account linked</h1>
+            <p>Your OIDC sign-in method is now linked to your Music Assistant account.</p>
+            <a href="/">Return to Music Assistant</a></body></html>
             """
-            return web.Response(text=error_html, content_type="text/html", status=500)
+            return web.Response(text=linked_html, content_type="text/html")
+        if not auth_result.success or not auth_result.user:
+            return web.Response(
+                text=_oauth_callback_error_html(auth_result.error or "Unknown error"),
+                content_type="text/html",
+                status=400,
+            )
+
+        token = await self.auth.create_token(auth_result.user, f"OAuth ({provider_id})")
+        final_redirect_url = auth_result.return_url or "/"
+        requires_consent = False
+        if auth_result.return_url:
+            is_valid, category = is_allowed_redirect_url(
+                auth_result.return_url, request, self.base_url, self.external_url
+            )
+            if not is_valid:
+                self.logger.warning("Invalid return_url blocked: %s", auth_result.return_url)
+                final_redirect_url = "/"
+            elif category == "external":
+                requires_consent = True
+        final_redirect_url = build_code_redirect_url(final_redirect_url, token)
+        callback_html_path = str(RESOURCES_DIR.joinpath("oauth_callback.html"))
+        async with aiofiles.open(callback_html_path) as file_handle:
+            success_html = await file_handle.read()
+        success_html = success_html.replace(
+            "{REQUIRES_CONSENT}", "true" if requires_consent else "false"
+        )
+        success_html = success_html.replace("{TOKEN}", _serialize_script_value(token))
+        success_html = success_html.replace(
+            "{REDIRECT_URL}", _serialize_script_value(final_redirect_url)
+        )
+        return web.Response(text=success_html, content_type="text/html")
+
+    @staticmethod
+    def _clear_link_cookie(
+        response: web.Response, cookie_name: str | None, secure: bool
+    ) -> web.Response:
+        """Clear the one-time browser binding cookie after a link callback."""
+        if cookie_name:
+            response.del_cookie(
+                cookie_name,
+                path="/auth/callback",
+                secure=secure,
+                httponly=True,
+                samesite="Lax",
+            )
+        return response
 
     async def _handle_setup_page(self, request: web.Request) -> web.StreamResponse:
         """Handle request for the first-time setup page (the frontend's account step)."""
@@ -1552,6 +1652,15 @@ class WebserverController(CoreController):
                 user.username if user else "unknown",
             )
             client.cancel()
+
+
+def _oauth_callback_error_html(message: str) -> str:
+    """Return a callback error page containing only escaped user-facing text."""
+    return f"""
+    <html><body><h1>Authentication Failed</h1>
+    <p>{html.escape(message)}</p>
+    <a href="/login">Back to Login</a></body></html>
+    """
 
 
 def _serialize_script_value(value: str) -> str:

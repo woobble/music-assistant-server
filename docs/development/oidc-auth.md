@@ -7,11 +7,12 @@ The webserver has a generic OIDC login provider with one configured issuer, regi
 and MA token issuance path. Pocket ID is one possible issuer; the implementation has no
 Pocket ID-specific URLs, claim names, or identity rules.
 
-This is backend-only. OIDC sign-in currently works for enabled MA users whose OIDC identity has
-already been explicitly linked. The provider does not create users, attach an identity by email or
-username, grant roles from OIDC claims, or advertise Remote Access app sign-in. Account linking
-and new-user provisioning are Goal 3 work. Browser, desktop and mobile callback compatibility,
-including cancellation behavior in the separate frontend package, remains Goal 4 work.
+This is backend-only. Enabled MA users can sign in with an OIDC identity that has been explicitly
+linked, and an authenticated user can link an identity through the web callback. Optional OIDC
+registration is disabled by default and can be enabled by an administrator. The provider never
+matches accounts by email or username, grants roles from OIDC claims, or advertises Remote Access
+app sign-in. Frontend integration and browser, desktop and mobile callback compatibility remain
+Goal 4 work.
 
 ## Configuration
 
@@ -23,11 +24,12 @@ Configure these advanced entries under **Settings → System → Webserver**:
 | `auth_oidc_client_id` | Client ID registered for Music Assistant. |
 | `auth_oidc_client_secret` | Confidential client secret, stored as a secure string. |
 | `auth_oidc_scopes` | Space-separated scopes, defaulting to `openid profile email`. Only those three scopes are accepted; `openid` is required. |
+| `auth_oidc_allow_registration` | Allow verified, unlinked identities to create regular MA users. Defaults to `false` and is independent of Home Assistant self-registration. |
 
-OIDC is disabled until issuer, client ID and client secret are all set and valid. The registration
-policy for this goal is fixed to **linked users only**; the Home Assistant
-`auth_allow_self_registration` setting does not change it. New-user registration is not available
-yet.
+OIDC is disabled until issuer, client ID and client secret are all set and valid. Registration
+also requires an existing enabled MA administrator, so an OIDC user cannot occupy the initial
+administrator setup path. New registrations always receive the regular `user` role, regardless of
+OIDC role claims.
 
 Use an HTTPS issuer in normal deployments. HTTP is accepted only for loopback addresses so tests
 can use a local mock issuer. Discovery, token, UserInfo and JWKS endpoints must be HTTPS too,
@@ -43,14 +45,18 @@ origin.
 
 ## Authorization flow
 
-1. The client starts the existing `GET /auth/authorize?provider_id=oidc` route or
-   `auth/authorization_url` command. The provider obtains authorization, token, UserInfo and JWKS
+1. A sign-in starts through the existing `GET /auth/authorize?provider_id=oidc` route or
+   `auth/authorization_url` command. A link starts through `POST /auth/oidc/link/start` with a
+   Music Assistant bearer session and `{"confirmed": true}`. The link endpoint checks the
+   `CONFIG_PROVIDERS_OWN` scope. The provider obtains authorization, token, UserInfo and JWKS
    endpoints from the configured issuer's discovery document and checks that the discovered
    `issuer` exactly matches configuration.
 2. `PendingLoginStore` creates independent random state, OIDC nonce and IdP PKCE verifier values.
    The pending record is server-side, expires after ten minutes, is usable once, and is subject
-   to the existing limit of 100 pending sign-ins. The authorization request uses PKCE S256 and
-   requests only the configured OIDC profile scopes.
+   to the existing limit of 100 pending authorization transactions. Link state has an `l.`
+   prefix; ordinary browser sign-in and native app states keep their existing `w.` and `n.`
+   prefixes. The authorization request uses PKCE S256 and requests only the configured OIDC
+   profile scopes.
 3. The browser returns to the fixed callback URI. The callback consumes state before provider,
    target, error or code validation. A denial or cancellation consumes state and returns a safe
    error page; `error_description` is ignored. Missing, mismatched, expired, replayed or malformed
@@ -64,11 +70,46 @@ origin.
    token must set `azp` to this client; any provided `azp` must match as well. The token header
    cannot choose an algorithm or JWKS URL.
 6. The provider fetches UserInfo over the validated issuer endpoint and requires its `sub` to
-   match the verified ID token. Profile claims are not used to change the MA account. The exact
-   `(issuer, sub)` pair is resolved through `AuthProviderType.OIDC`; disabled users are refused,
-   and unlinked identities fail. OIDC roles and profile claims never grant MA privileges.
-7. On success, the existing callback handler issues an MA token and applies the existing
-   redirect allowlist and external-return consent behavior.
+   match the verified ID token. For a link transaction, the callback also checks the one-time
+   HttpOnly browser cookie and the initiating MA session. It then rechecks the enabled account
+   and active session in the same database transaction that inserts the provider link. For a
+   login transaction, the exact `(issuer, sub)` pair is resolved through `AuthProviderType.OIDC`.
+   Disabled users are refused. An unlinked identity fails unless OIDC registration is enabled.
+   OIDC roles and profile claims never grant MA privileges or modify an existing account.
+7. A successful login issues an MA token and applies the existing redirect allowlist and
+   external-return consent behavior. A successful link returns a simple success page and never
+   issues a new MA token or turns the callback into a login.
+
+## Account linking, unlinking and administration
+
+`POST /auth/oidc/link/start` is the only HTTP endpoint that starts account linking. It requires
+an enabled authenticated user, a valid bearer session, `CONFIG_PROVIDERS_OWN`, and an explicit
+`confirmed: true` request value. It returns only the authorization URL and sets a random,
+state-specific, ten-minute HttpOnly `SameSite=Lax` cookie. The cookie is marked `Secure` when the
+fixed callback uses HTTPS. Pending server state stores hashes of the cookie value and MA session
+token, along with the initiating user ID; it does not expose the binding or PKCE verifier in the
+response. Link callbacks are browser-only and must return to the fixed OIDC callback URI.
+
+The WebSocket/API commands are:
+
+| Command | Scope | Purpose |
+| --- | --- | --- |
+| `auth/user/providers` | `CONFIG_PROVIDERS_OWN` | List the current user's linked methods. Builtin password hashes and encoded OIDC identities are hidden. |
+| `auth/oidc/unlink` | `CONFIG_PROVIDERS_OWN` | Remove one OIDC link by `link_id`; requires `confirmed: true` and a current session issued within the last five minutes. |
+| `auth/oidc/registration_policy` | `USERS_MANAGE` | Read whether OIDC registration is enabled. |
+| `auth/oidc/registration_policy/set` | `USERS_MANAGE` | Persist the OIDC registration policy in webserver configuration. |
+| `auth/user/unlink_provider` | `USERS_MANAGE` | Administrator override to remove a provider type from a selected user; requires confirmation and a recent admin session. |
+
+Unlinking is idempotent. The operation refuses to remove the last login method that is currently
+usable on the server. It removes only the selected provider link; it preserves the MA account,
+other links, tokens and user data. An administrator can remove another user's provider link only
+through the explicit admin command.
+
+The registration policy is also available as the advanced webserver configuration entry
+`auth_oidc_allow_registration`, defaulting to disabled. It does not change Home Assistant's
+`auth_allow_self_registration` policy. New usernames are sanitized from `preferred_username` or
+derived from a digest of the issuer-qualified identity, then made unique. A collision never
+attaches OIDC to the existing MA account.
 
 Discovery is cached for 15 minutes and JWKS for five minutes, with concurrent refreshes
 coalesced. An unknown `kid` triggers one JWKS refresh; a signature failure also gets one refreshed
@@ -98,9 +139,12 @@ unknown-enum fallback means an older server/model build would interpret an OIDC 
 do not run OIDC links on a build that lacks the new enum, and treat rollback to such a build as
 unsupported until a rollback strategy exists.
 
-The OIDC flow only reads an existing provider link, so it does not create or race to insert links.
-Account linking in Goal 3 must use the database uniqueness constraint and handle concurrent
-attempts without attaching a link to a different user.
+Account linking and optional provisioning use the existing database uniqueness constraint on
+`(provider_type, provider_user_id)`. Link creation and new-user creation plus link insertion run
+atomically. A repeated link by its existing owner is idempotent; a link owned by another user is
+rejected. The server database transaction serializes local writes, while SQLite's uniqueness
+constraint remains authoritative for competing requests from separate connections. A failed
+provisioning transaction leaves neither an orphan MA user nor an orphan provider link.
 
 ## Tests
 
@@ -119,6 +163,10 @@ Focused coverage lives in:
 - `tests/test_webserver_auth.py`
 - Shared model coverage in `tests/test_auth.py` in the models repository
 
+The Goal 3 cases also cover authenticated linking, cookie and session binding, link/login state
+separation, cross-user conflicts, repeated and concurrent linking, unlink safeguards, registration
+policy, username collisions and concurrent provisioning.
+
 Run the focused backend tests with:
 
 ```sh
@@ -131,9 +179,8 @@ pytest tests/controllers/webserver/test_oidc_auth.py \
 
 ## Remaining work
 
-- **Goal 3:** authenticated account linking with explicit user confirmation, safe account
-  provisioning policy, management/removal, and concurrency handling for new links.
-- **Goal 4:** frontend and mobile callback compatibility, including provider denial and
-  cancellation, and an end-to-end check of token handling and Remote Access support.
+- **Goal 4:** frontend integration for starting and managing linked identities, plus browser,
+  desktop and mobile callback compatibility. Verify provider denial/cancellation behavior and
+  token handling end to end before enabling Remote Access sign-in.
 - Publish the coordinated models release before deploying this server change to environments
   that install the shared package from its normal package index.

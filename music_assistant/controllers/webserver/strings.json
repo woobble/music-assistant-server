@@ -22,7 +22,11 @@
     },
     "auth_oidc_scopes": {
       "label": "OpenID Connect scopes",
-      "description": "Space-separated OIDC scopes. Only openid, profile and email are accepted. Sign-in is limited to existing linked accounts; new-user registration and account linking are deferred."
+      "description": "Space-separated OIDC scopes. Only openid, profile and email are accepted."
+    },
+    "auth_oidc_allow_registration": {
+      "label": "Allow OIDC account registration",
+      "description": "Allow verified OIDC identities that are not linked to an account to create a regular Music Assistant user. This is independent of Home Assistant self-registration."
     },
     "base_url": {
       "label": "Internal URL",

@@ -37,11 +37,27 @@ class AuthTransport(StrEnum):
     INGRESS = "ingress"  # Home Assistant ingress (already signed in)
 
 
+class AuthTransactionIntent(StrEnum):
+    """Purpose of a pending authorization transaction."""
+
+    LOGIN = "login"
+    LINK = "link"
+
+
+@dataclass(frozen=True)
+class PendingLinkContext:
+    """Session and browser binding fields for a pending account-linking transaction."""
+
+    initiating_user_id: str
+    initiating_session_hash: str
+    callback_binding_hash: str
+
+
 @dataclass
 class PendingLogin:
-    """A sign-in that was started and waits for the browser to return."""
+    """An authorization transaction that waits for the browser to return."""
 
-    state: str  # "w.<token>" (web) or "n.<token>" (native app)
+    state: str  # "w.<token>" (web), "n.<token>" (native app) or "l.<token>" (link)
     provider_id: str
     transport: AuthTransport
     redirect_uri: str  # exactly what was sent to the identity provider
@@ -51,10 +67,14 @@ class PendingLogin:
     oidc_nonce: str | None = None
     return_url: str | None = None
     client_code_challenge: str | None = None  # S256 only
+    intent: AuthTransactionIntent = AuthTransactionIntent.LOGIN
+    initiating_user_id: str | None = None
+    initiating_session_hash: str | None = None
+    callback_binding_hash: str | None = None
 
 
 class PendingLoginStore:
-    """In-memory store of the pending sign-ins, each usable once."""
+    """In-memory store of pending authorization transactions, each usable once."""
 
     def __init__(self) -> None:
         """Initialize an empty store."""
@@ -70,9 +90,11 @@ class PendingLoginStore:
         redirect_target: RedirectTarget = "server",
         return_url: str | None = None,
         client_code_challenge: str | None = None,
+        intent: AuthTransactionIntent = AuthTransactionIntent.LOGIN,
+        link_context: PendingLinkContext | None = None,
     ) -> PendingLogin:
         """
-        Start a sign-in and return it, with a new state.
+        Start an authorization transaction and return it, with a new state.
 
         :param provider_id: The id of the login provider the sign-in is for.
         :param transport: How the client that starts the sign-in reaches the server.
@@ -81,6 +103,8 @@ class PendingLoginStore:
         :param redirect_target: Whether the browser returns to the server or the remote app.
         :param return_url: The validated URL the client returns to after signing in.
         :param client_code_challenge: The client's PKCE S256 code challenge, if any.
+        :param intent: The purpose of this authorization transaction.
+        :param link_context: Session and browser binding values for account linking.
         :raises RateLimited: If too many sign-ins are pending.
         """
         now = time.monotonic()
@@ -90,7 +114,13 @@ class PendingLoginStore:
             del self._pending[expired]
         if len(self._pending) >= MAX_PENDING_LOGINS:
             raise RateLimited("Too many sign-ins are pending")
-        prefix = "n" if return_url and return_url.startswith(NATIVE_APP_SCHEME) else "w"
+        prefix = (
+            "l"
+            if intent is AuthTransactionIntent.LINK
+            else "n"
+            if return_url and return_url.startswith(NATIVE_APP_SCHEME)
+            else "w"
+        )
         pending = PendingLogin(
             state=f"{prefix}.{secrets.token_urlsafe(32)}",
             provider_id=provider_id,
@@ -102,6 +132,12 @@ class PendingLoginStore:
             oidc_nonce=secrets.token_urlsafe(32),
             return_url=return_url,
             client_code_challenge=client_code_challenge,
+            intent=intent,
+            initiating_user_id=link_context.initiating_user_id if link_context else None,
+            initiating_session_hash=(
+                link_context.initiating_session_hash if link_context else None
+            ),
+            callback_binding_hash=link_context.callback_binding_hash if link_context else None,
         )
         self._pending[pending.state] = pending
         return pending

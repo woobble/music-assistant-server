@@ -225,6 +225,7 @@ CONF_AUTH_OIDC_ISSUER: Final[str] = "auth_oidc_issuer"
 CONF_AUTH_OIDC_CLIENT_ID: Final[str] = "auth_oidc_client_id"
 CONF_AUTH_OIDC_CLIENT_SECRET: Final[str] = "auth_oidc_client_secret"  # noqa: S105
 CONF_AUTH_OIDC_SCOPES: Final[str] = "auth_oidc_scopes"
+CONF_AUTH_OIDC_ALLOW_REGISTRATION: Final[str] = "auth_oidc_allow_registration"
 CONF_ZEROCONF_INTERFACES: Final[str] = "zeroconf_interfaces"
 CONF_ENABLED: Final[str] = "enabled"
 CONF_PROTOCOL_KEY_SPLITTER: Final[str] = "||protocol||"

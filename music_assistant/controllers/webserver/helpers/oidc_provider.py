@@ -17,18 +17,24 @@ from urllib.parse import parse_qsl, quote_plus, urlencode, urlsplit, urlunsplit
 import aiohttp
 import jwt
 from jwt.exceptions import InvalidSignatureError, PyJWTError
-from music_assistant_models.auth import AuthProviderType, User
 from music_assistant_models.errors import AuthenticationFailed
 
+from music_assistant.constants import CONF_AUTH_OIDC_ALLOW_REGISTRATION
 from music_assistant.controllers.webserver.helpers.auth_providers import (
     AuthResult,
     LoginProvider,
     LoginProviderConfig,
+    get_oidc_auth_provider_type,
 )
-from music_assistant.controllers.webserver.helpers.login_flow import PendingLogin
+from music_assistant.controllers.webserver.helpers.login_flow import (
+    AuthTransactionIntent,
+    PendingLogin,
+)
 from music_assistant.helpers.pkce import pkce_challenge
 
 if TYPE_CHECKING:
+    from music_assistant_models.auth import AuthProviderType, User
+
     from music_assistant import MusicAssistant
 
 DISCOVERY_TTL = 900
@@ -46,6 +52,15 @@ class OIDCProviderConfig(LoginProviderConfig):
     client_id: str
     client_secret: str
     scopes: str
+
+
+@dataclass(frozen=True)
+class VerifiedOIDCIdentity:
+    """An OIDC identity whose token and UserInfo response have been verified."""
+
+    provider_user_id: str
+    preferred_username: str | None
+    display_name: str | None
 
 
 def is_valid_oidc_issuer_url(value: Any) -> bool:
@@ -141,7 +156,7 @@ class OIDCLoginProvider(LoginProvider):
     @property
     def provider_type(self) -> AuthProviderType:
         """Return the OIDC auth provider type."""
-        return AuthProviderType.OIDC
+        return get_oidc_auth_provider_type()
 
     @property
     def requires_redirect(self) -> bool:
@@ -211,9 +226,41 @@ class OIDCLoginProvider(LoginProvider):
         :param params: The authorization code returned by the issuer.
         :raises AuthenticationFailed: If the OIDC identity can not authenticate.
         """
+        if pending.intent is not AuthTransactionIntent.LOGIN:
+            raise AuthenticationFailed("This OIDC transaction is not a sign-in")
+        identity = await self.verify_identity(pending, params)
+        user = await self.auth_manager.get_user_by_provider_link(
+            get_oidc_auth_provider_type(), identity.provider_user_id, include_disabled=True
+        )
+        if user is not None:
+            if not user.enabled:
+                raise AuthenticationFailed(
+                    "User account is disabled", translation_key="user_account_disabled"
+                )
+            return user
+        if not self.allow_user_registration:
+            raise AuthenticationFailed("This OIDC account is not linked to a Music Assistant user")
+        return await self.auth_manager.create_or_get_oidc_user(identity)
+
+    @property
+    def allow_user_registration(self) -> bool:
+        """Return whether OIDC-specific account provisioning is enabled."""
+        config = getattr(self.mass.webserver, "config", None)
+        return bool(config and config.get_value(CONF_AUTH_OIDC_ALLOW_REGISTRATION, False))
+
+    async def verify_identity(
+        self, pending: PendingLogin, params: Mapping[str, str]
+    ) -> VerifiedOIDCIdentity:
+        """
+        Exchange and validate an OIDC authorization response without resolving its MA account.
+
+        :param pending: The single-use server-side authorization state.
+        :param params: The authorization code returned by the issuer.
+        :raises AuthenticationFailed: If the OIDC identity can not be verified.
+        """
         code = params.get("code")
         if not code or not pending.oidc_nonce:
-            raise AuthenticationFailed("The OIDC sign-in response is incomplete")
+            raise AuthenticationFailed("The OIDC authorization response is incomplete")
         try:
             metadata = await self._get_metadata()
             token_response = await self._exchange_code(metadata, pending, code)
@@ -230,23 +277,30 @@ class OIDCLoginProvider(LoginProvider):
             claims = await self._validate_id_token(metadata, id_token, pending.oidc_nonce)
             subject = claims.get("sub")
             userinfo = await self._get_userinfo(metadata, access_token)
-            if not isinstance(subject, str) or userinfo.get("sub") != subject:
+            if (
+                not isinstance(subject, str)
+                or not subject
+                or len(subject) > 255
+                or userinfo.get("sub") != subject
+            ):
                 raise _OIDCError  # noqa: TRY301 - mapped to a fixed public error below
             identity_key = oidc_identity_key(self.issuer, subject)
         except Exception as err:
-            self.logger.warning("OIDC sign-in failed (%s)", type(err).__name__)
-            raise AuthenticationFailed("The OIDC sign-in could not be completed") from err
-
-        user = await self.auth_manager.get_user_by_provider_link(
-            AuthProviderType.OIDC, identity_key, include_disabled=True
+            self.logger.warning("OIDC authorization failed (%s)", type(err).__name__)
+            raise AuthenticationFailed("The OIDC authorization could not be completed") from err
+        preferred_username = userinfo.get("preferred_username") or claims.get("preferred_username")
+        display_name = userinfo.get("name") or claims.get("name")
+        return VerifiedOIDCIdentity(
+            provider_user_id=identity_key,
+            preferred_username=(
+                preferred_username
+                if isinstance(preferred_username, str) and len(preferred_username) <= 256
+                else None
+            ),
+            display_name=(
+                display_name if isinstance(display_name, str) and len(display_name) <= 128 else None
+            ),
         )
-        if user is None:
-            raise AuthenticationFailed("This OIDC account is not linked to a Music Assistant user")
-        if not user.enabled:
-            raise AuthenticationFailed(
-                "User account is disabled", translation_key="user_account_disabled"
-            )
-        return user
 
     async def _get_metadata(self) -> _OIDCMetadata:
         now = time.monotonic()

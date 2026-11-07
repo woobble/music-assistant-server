@@ -216,6 +216,7 @@ class DatabaseConnection:
         self._deferred_commit_depth: ContextVar[int] = ContextVar(
             "deferred_commit_depth", default=0
         )
+        self._write_lock = asyncio.Lock()
         self._tracking_loop_stalls = False
 
     async def setup(
@@ -283,7 +284,7 @@ class DatabaseConnection:
             sql_query += f" ORDER BY {order_by}"
         if limit:
             sql_query += f" LIMIT {limit} OFFSET {offset}"
-        async with debug_query(sql_query):
+        async with self._write_lock, debug_query(sql_query):
             return cast(
                 "list[Mapping[str, Any]]", await self._db.execute_fetchall(sql_query, match)
             )
@@ -299,7 +300,7 @@ class DatabaseConnection:
         if limit:
             query += f" LIMIT {limit} OFFSET {offset}"
         _query, _params = query_params(query, params)
-        async with debug_query(_query, _params):
+        async with self._write_lock, debug_query(_query, _params):
             return cast("list[Mapping[str, Any]]", await self._db.execute_fetchall(_query, _params))
 
     async def iter_rows_from_query(
@@ -309,7 +310,11 @@ class DatabaseConnection:
     ) -> AsyncGenerator[Mapping[str, Any]]:
         """Stream rows for a given custom query without materializing the full result."""
         _query, _params = query_params(query, params)
-        async with debug_query(_query, _params), self._db.execute(_query, _params) as cursor:
+        async with (
+            self._write_lock,
+            debug_query(_query, _params),
+            self._db.execute(_query, _params) as cursor,
+        ):
             async for row in cursor:
                 yield cast("Mapping[str, Any]", row)
 
@@ -321,7 +326,7 @@ class DatabaseConnection:
         """Get row count for given custom query."""
         query = f"SELECT count() FROM ({query})"
         _query, _params = query_params(query, params)
-        async with debug_query(_query):
+        async with self._write_lock, debug_query(_query):
             async with self._db.execute(_query, _params) as cursor:
                 if result := await cursor.fetchone():
                     assert isinstance(result[0], int)  # for type checking
@@ -334,7 +339,7 @@ class DatabaseConnection:
     ) -> int:
         """Get row count for given table."""
         query = f"SELECT count(*) FROM {table}"
-        async with debug_query(query):
+        async with self._write_lock, debug_query(query):
             async with self._db.execute(query) as cursor:
                 if result := await cursor.fetchone():
                     assert isinstance(result[0], int)  # for type checking
@@ -347,7 +352,7 @@ class DatabaseConnection:
         """Search table by column."""
         sql_query = f"SELECT * FROM {table} WHERE {table}.{column} LIKE :search"
         params = {"search": f"%{search}%"}
-        async with debug_query(sql_query, params):
+        async with self._write_lock, debug_query(sql_query, params):
             return cast(
                 "list[Mapping[str, Any]]", await self._db.execute_fetchall(sql_query, params)
             )
@@ -356,7 +361,11 @@ class DatabaseConnection:
         """Get single row for given table where column matches keys/values."""
         sql_query = f"SELECT * FROM {table} WHERE "
         sql_query += " AND ".join(f"{table}.{x} = :{x}" for x in match)
-        async with debug_query(sql_query, match), self._db.execute(sql_query, match) as cursor:
+        async with (
+            self._write_lock,
+            debug_query(sql_query, match),
+            self._db.execute(sql_query, match) as cursor,
+        ):
             return cast("Mapping[str, Any] | None", await cursor.fetchone())
 
     async def insert(
@@ -374,8 +383,9 @@ class DatabaseConnection:
         else:
             sql_query = f"INSERT INTO {table}({','.join(keys)})"
         sql_query += f" VALUES ({','.join(f':{x}' for x in keys)})"
-        row_id = await self._db.execute_insert(sql_query, values)
-        await self._maybe_commit()
+        async with self._write_lock:
+            row_id = await self._db.execute_insert(sql_query, values)
+            await self._maybe_commit()
         assert row_id is not None  # for type checking
         assert isinstance(row_id[0], int)  # for type checking
         return row_id[0]
@@ -393,8 +403,9 @@ class DatabaseConnection:
             f"INSERT INTO {table}({','.join(keys)}) VALUES ({','.join(f':{x}' for x in keys)})"
         )
         sql_query += f" ON CONFLICT DO UPDATE SET {','.join(f'{x}=:{x}' for x in keys)}"
-        await self._db.execute(sql_query, values)
-        await self._maybe_commit()
+        async with self._write_lock:
+            await self._db.execute(sql_query, values)
+            await self._maybe_commit()
 
     async def upsert_many(
         self, table: str, values: Sequence[dict[str, Any]], immutable: Sequence[str] = ()
@@ -421,20 +432,22 @@ class DatabaseConnection:
             filtered_row = {k: v for k, v in row.items() if v is not UNSET}
             rows_per_column_set.setdefault(tuple(sorted(filtered_row)), []).append(filtered_row)
         untouched = 0
-        for keys, rows in rows_per_column_set.items():
-            sql_query = (
-                f"INSERT INTO {table}({','.join(keys)}) VALUES ({','.join(f':{x}' for x in keys)})"
-            )
-            sql_query += f" ON CONFLICT DO UPDATE SET {','.join(f'{x}=:{x}' for x in keys)}"
-            if guards := [x for x in immutable if x in keys]:
-                # IS also holds for a NULL on both sides, unlike =
-                sql_query += " WHERE " + " AND ".join(
-                    f"{table}.{x} IS excluded.{x}" for x in guards
+        async with self._write_lock:
+            for keys, rows in rows_per_column_set.items():
+                sql_query = (
+                    f"INSERT INTO {table}({','.join(keys)}) "
+                    f"VALUES ({','.join(f':{x}' for x in keys)})"
                 )
-            cursor = await self._db.executemany(sql_query, rows)
-            # a row neither inserted nor updated was held back by the guard
-            untouched += len(rows) - cursor.rowcount
-        await self._maybe_commit()
+                sql_query += f" ON CONFLICT DO UPDATE SET {','.join(f'{x}=:{x}' for x in keys)}"
+                if guards := [x for x in immutable if x in keys]:
+                    # IS also holds for a NULL on both sides, unlike =
+                    sql_query += " WHERE " + " AND ".join(
+                        f"{table}.{x} IS excluded.{x}" for x in guards
+                    )
+                cursor = await self._db.executemany(sql_query, rows)
+                # a row neither inserted nor updated was held back by the guard
+                untouched += len(rows) - cursor.rowcount
+            await self._maybe_commit()
         return untouched
 
     async def update(
@@ -449,8 +462,9 @@ class DatabaseConnection:
         keys = tuple(values.keys())
         sql_query = f"UPDATE {table} SET {','.join(f'{x}=:{x}' for x in keys)} WHERE "
         sql_query += " AND ".join(f"{x} = :{x}" for x in match)
-        await self.execute(sql_query, {**match, **values})
-        await self._maybe_commit()
+        async with self._write_lock:
+            await self._db.execute(sql_query, {**match, **values})
+            await self._maybe_commit()
 
     async def delete(
         self, table: str, match: dict[str, Any] | None = None, query: str | None = None
@@ -464,18 +478,21 @@ class DatabaseConnection:
             sql_query += "WHERE " + query
         elif query:
             sql_query += query
-        await self.execute(sql_query, match)
-        await self._maybe_commit()
+        async with self._write_lock:
+            await self._db.execute(sql_query, match)
+            await self._maybe_commit()
 
     async def delete_where_query(self, table: str, query: str | None = None) -> None:
         """Delete data in given table using given where clausule."""
         sql_query = f"DELETE FROM {table} WHERE {query}"
-        await self.execute(sql_query)
-        await self._maybe_commit()
+        async with self._write_lock:
+            await self._db.execute(sql_query)
+            await self._maybe_commit()
 
     async def execute(self, query: str, values: dict[str, Any] | None = None) -> Any:
         """Execute command on the database."""
-        return await self._db.execute(query, values)
+        async with self._write_lock:
+            return await self._db.execute(query, values)
 
     async def execute_write(self, query: str, values: dict[str, Any] | None = None) -> None:
         """
@@ -488,12 +505,44 @@ class DatabaseConnection:
         :param query: The statement to execute.
         :param values: The values to bind to the statement's named parameters.
         """
-        await self._db.execute(query, values)
-        await self._maybe_commit()
+        async with self._write_lock:
+            await self._db.execute(query, values)
+            await self._maybe_commit()
 
     async def commit(self) -> None:
         """Commit the current transaction."""
-        return await self._db.commit()
+        async with self._write_lock:
+            return await self._db.commit()
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncGenerator[aiosqlite.Connection]:
+        """
+        Run a group of database writes in one transaction.
+
+        The yielded connection must be used for all statements in the transaction. Other
+        writes through this DatabaseConnection wait until the transaction commits or rolls
+        back.
+        """
+        async with self._write_lock:
+            nested = self._db.in_transaction
+            if nested:
+                await self._db.execute("SAVEPOINT ma_transaction")
+            else:
+                await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._db
+            except BaseException:
+                if nested:
+                    await self._db.execute("ROLLBACK TO SAVEPOINT ma_transaction")
+                    await self._db.execute("RELEASE SAVEPOINT ma_transaction")
+                else:
+                    await self._db.rollback()
+                raise
+            else:
+                if nested:
+                    await self._db.execute("RELEASE SAVEPOINT ma_transaction")
+                else:
+                    await self._db.commit()
 
     @asynccontextmanager
     async def deferred_commit(self) -> AsyncGenerator[None]:
@@ -521,7 +570,8 @@ class DatabaseConnection:
             # scope's statements in the same underlying SQLite transaction and a
             # rollback would revert their (already acknowledged) writes as well
             if depth == 0:
-                await self._db.commit()
+                async with self._write_lock:
+                    await self._db.commit()
 
     async def iter_items(
         self,
@@ -563,15 +613,16 @@ class DatabaseConnection:
         # VACUUM rebuilds the whole database in temp storage; with temp_store=memory that
         # copy lives entirely in RAM and OOMs memory constrained devices on large databases,
         # so spill it to a temp file (located at SQLITE_TMPDIR) for the duration.
-        await self._db.execute("PRAGMA temp_store=FILE;")
-        try:
-            await self._db.execute("VACUUM")
-            await self._db.commit()
-            # in WAL mode VACUUM writes the rebuilt database into the WAL file instead of
-            # freeing disk space immediately, so checkpoint and truncate it right away
-            await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-        finally:
-            await self._db.execute("PRAGMA temp_store=memory;")
+        async with self._write_lock:
+            await self._db.execute("PRAGMA temp_store=FILE;")
+            try:
+                await self._db.execute("VACUUM")
+                await self._db.commit()
+                # in WAL mode VACUUM writes the rebuilt database into the WAL file instead of
+                # freeing disk space immediately, so checkpoint and truncate it right away
+                await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            finally:
+                await self._db.execute("PRAGMA temp_store=memory;")
 
     async def _get_pragma_int(self, pragma: str) -> int:
         """Return the integer value of a single-value sqlite PRAGMA."""

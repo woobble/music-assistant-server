@@ -491,3 +491,39 @@ async def test_slow_query_warning_survives_a_stall_that_precedes_it(
         time.sleep(0.5)  # noqa: ASYNC251  # stalling the loop is what is under test here
         await debug_db.get_rows_from_query(_SLOW_QUERY, limit=0)
     assert "SQL Query took" in caplog.text
+
+
+async def test_transaction_rolls_back_only_its_own_writes_inside_deferred_commit(
+    db_with_table: DatabaseConnection,
+) -> None:
+    """A nested transaction rolls back its writes and leaves earlier deferred writes intact."""
+
+    async def write_nested_then_fail() -> None:
+        async with db_with_table.transaction() as connection:
+            await connection.execute("INSERT INTO items(name) VALUES ('nested')")
+            raise ValueError("rollback")
+
+    async with db_with_table.deferred_commit():
+        await db_with_table.insert("items", {"name": "outer"})
+        with pytest.raises(ValueError, match="rollback"):
+            await write_nested_then_fail()
+        rows = await db_with_table.get_rows("items", limit=0)
+        assert [row["name"] for row in rows] == ["outer"]
+
+    rows = await db_with_table.get_rows("items", limit=0)
+    assert [row["name"] for row in rows] == ["outer"]
+
+
+async def test_transaction_serializes_database_helper_writes(
+    db_with_table: DatabaseConnection,
+) -> None:
+    """Helper writes from another task wait for a transaction to commit or roll back."""
+    async with db_with_table.transaction() as connection:
+        await connection.execute("INSERT INTO items(name) VALUES ('transaction')")
+        helper_write = asyncio.create_task(db_with_table.insert("items", {"name": "helper"}))
+        await asyncio.sleep(0)
+        assert not helper_write.done()
+
+    await helper_write
+    rows = await db_with_table.get_rows("items", limit=0, order_by="name")
+    assert [row["name"] for row in rows] == ["helper", "transaction"]

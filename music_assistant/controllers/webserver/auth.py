@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import hmac
 import logging
+import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable, Collection, Mapping
 from datetime import datetime, timedelta
-from sqlite3 import IntegrityError, OperationalError
+from sqlite3 import IntegrityError, OperationalError, Row
 from typing import TYPE_CHECKING, Any, cast
 
 import jwt as pyjwt
@@ -32,6 +34,7 @@ from music_assistant_models.errors import (
 )
 
 from music_assistant.constants import (
+    CONF_AUTH_OIDC_ALLOW_REGISTRATION,
     CONF_AUTH_OIDC_CLIENT_ID,
     CONF_AUTH_OIDC_CLIENT_SECRET,
     CONF_AUTH_OIDC_ISSUER,
@@ -62,12 +65,15 @@ from music_assistant.controllers.webserver.helpers.auth_providers import (
     HomeAssistantProviderConfig,
     LoginProvider,
     LoginRateLimiter,
+    get_oidc_auth_provider_type,
     normalize_username,
 )
 from music_assistant.controllers.webserver.helpers.login_flow import (
     AUTH_CODE_RE,
     PKCE_CHALLENGE_RE,
+    AuthTransactionIntent,
     AuthTransport,
+    PendingLinkContext,
     PendingLogin,
     PendingLoginStore,
     RedirectTarget,
@@ -76,6 +82,7 @@ from music_assistant.controllers.webserver.helpers.login_flow import (
 from music_assistant.controllers.webserver.helpers.oidc_provider import (
     OIDCLoginProvider,
     OIDCProviderConfig,
+    VerifiedOIDCIdentity,
     is_valid_oidc_client_id,
     is_valid_oidc_issuer_url,
     is_valid_oidc_scopes,
@@ -112,6 +119,7 @@ HA_TOKEN_ROTATION_MARGIN = 7
 TOKEN_ACTIVITY_PERSIST_INTERVAL = timedelta(hours=1)
 # Max number of (newest first) tokens returned by the auth/tokens command
 TOKEN_LIST_LIMIT = 100
+OIDC_LINK_COOKIE_PREFIX = "ma_oidc_link_"
 
 HA_TOKEN_SETTING_KEY = "ha_integration_token"  # noqa: S105 - config key
 HA_TOKEN_NAME = "Home Assistant Integration"  # noqa: S105 - display name
@@ -172,6 +180,8 @@ class AuthenticationManager:
         self._auth_exchange_rate_limiter = LoginRateLimiter(subject="client")
         # Serialises the read-modify-write of the user access filters
         self._user_filter_lock = asyncio.Lock()
+        self._provider_link_lock = asyncio.Lock()
+        self._oidc_registration_lock = asyncio.Lock()
         self._custom_roles: dict[str, Role] = {}
         self._access_revoked_callbacks: list[Callable[[User], None]] = []
 
@@ -558,6 +568,8 @@ class AuthenticationManager:
         user: User,
         provider_type: AuthProviderType,
         provider_user_id: str,
+        *,
+        required_session_hash: str | None = None,
     ) -> UserAuthProvider:
         """
         Link a user to an authentication provider.
@@ -567,46 +579,289 @@ class AuthenticationManager:
         :param user: The user to link.
         :param provider_type: The provider type.
         :param provider_user_id: The user ID from the provider (e.g., password hash, OAuth ID).
+        :param required_session_hash: Require this active session in the same transaction.
         """
-        # Check if a link already exists for this provider/provider_user_id
-        existing_link = await self.database.get_row(
-            "user_auth_providers",
-            {
+        async with self._provider_link_lock:
+            link_id = secrets.token_urlsafe(32)
+            created_at = utc()
+            link_data = {
+                "link_id": link_id,
+                "user_id": user.user_id,
                 "provider_type": provider_type.value,
                 "provider_user_id": provider_user_id,
-            },
-        )
+                "created_at": created_at.isoformat(),
+            }
+            try:
+                async with self.database.transaction() as connection:
+                    async with connection.execute(
+                        "SELECT enabled FROM users WHERE user_id = :user_id",
+                        {"user_id": user.user_id},
+                    ) as cursor:
+                        user_row = await cursor.fetchone()
+                    if not user_row or not user_row["enabled"]:
+                        raise AuthenticationFailed("The Music Assistant account is disabled")
+                    if required_session_hash:
+                        async with connection.execute(
+                            "SELECT created_at, expires_at, is_long_lived FROM auth_tokens "
+                            "WHERE user_id = :user_id AND token_hash = :token_hash",
+                            {
+                                "user_id": user.user_id,
+                                "token_hash": required_session_hash,
+                            },
+                        ) as cursor:
+                            session_row = await cursor.fetchone()
+                        if not session_row or not self._session_row_is_valid(session_row):
+                            raise AuthenticationRequired(
+                                "The account-linking session is invalid or expired"
+                            )
+                    async with connection.execute(
+                        "SELECT link_id, user_id, provider_type, provider_user_id, created_at "
+                        "FROM user_auth_providers WHERE provider_type = :provider_type "
+                        "AND provider_user_id = :provider_user_id",
+                        {
+                            "provider_type": provider_type.value,
+                            "provider_user_id": provider_user_id,
+                        },
+                    ) as cursor:
+                        raw_existing_link = await cursor.fetchone()
+                    if raw_existing_link:
+                        link_data = dict(raw_existing_link)
+                    else:
+                        async with connection.execute(
+                            "INSERT INTO user_auth_providers "
+                            "(link_id, user_id, provider_type, provider_user_id, created_at) "
+                            "VALUES (:link_id, :user_id, :provider_type, :provider_user_id, "
+                            ":created_at)",
+                            link_data,
+                        ):
+                            pass
+            except IntegrityError as err:
+                # The unique database constraint remains authoritative across concurrent
+                # requests and processes; an identical retry is safe for the same owner.
+                existing_link = await self.database.get_row(
+                    "user_auth_providers",
+                    {
+                        "provider_type": provider_type.value,
+                        "provider_user_id": provider_user_id,
+                    },
+                )
+                if existing_link:
+                    return self._provider_link_for_user(existing_link, user)
+                raise InvalidDataError(
+                    "The authentication provider could not be linked",
+                    translation_key="auth_provider_link_failed",
+                ) from err
 
-        if existing_link:
-            # Link already exists - return it
+            if link_data["link_id"] != link_id:
+                return self._provider_link_for_user(link_data, user)
+
             return UserAuthProvider(
-                link_id=existing_link["link_id"],
-                user_id=existing_link["user_id"],
-                provider_type=AuthProviderType(existing_link["provider_type"]),
-                provider_user_id=existing_link["provider_user_id"],
-                created_at=datetime.fromisoformat(existing_link["created_at"]),
+                link_id=link_id,
+                user_id=user.user_id,
+                provider_type=provider_type,
+                provider_user_id=provider_user_id,
+                created_at=created_at,
             )
 
-        # Create new link
-        link_id = secrets.token_urlsafe(32)
-        created_at = utc()
-        link_data = {
-            "link_id": link_id,
-            "user_id": user.user_id,
-            "provider_type": provider_type.value,
-            "provider_user_id": provider_user_id,
-            "created_at": created_at.isoformat(),
-        }
+    async def create_or_get_oidc_user(self, identity: VerifiedOIDCIdentity) -> User:
+        """
+        Resolve an existing OIDC link or atomically provision a regular user and its link.
 
-        await self.database.insert("user_auth_providers", link_data)
+        :param identity: An OIDC identity whose ID token and UserInfo response are verified.
+        :raises AuthenticationFailed: If registration is disabled or the account can not be made.
+        """
+        async with self._oidc_registration_lock:
+            existing_user = await self.get_user_by_provider_link(
+                get_oidc_auth_provider_type(), identity.provider_user_id, include_disabled=True
+            )
+            if existing_user:
+                if not existing_user.enabled:
+                    raise AuthenticationFailed(
+                        "User account is disabled", translation_key="user_account_disabled"
+                    )
+                return existing_user
 
-        return UserAuthProvider(
-            link_id=link_id,
-            user_id=user.user_id,
-            provider_type=provider_type,
-            provider_user_id=provider_user_id,
-            created_at=created_at,
+            if not bool(self.webserver.config.get_value(CONF_AUTH_OIDC_ALLOW_REGISTRATION, False)):
+                raise AuthenticationFailed(
+                    "This OIDC account is not linked to a Music Assistant user"
+                )
+            if not await self.database.get_count_from_query(
+                "SELECT user_id FROM users WHERE role = :role AND enabled = 1",
+                {"role": UserRole.ADMIN.value},
+            ):
+                raise AuthenticationFailed("OIDC registration requires an existing administrator")
+
+            base_username = _oidc_username_base(identity)
+            for attempt in range(5):
+                username = await self._get_available_oidc_username(base_username, attempt)
+                user_id = secrets.token_urlsafe(32)
+                created_at = utc()
+                link_id = secrets.token_urlsafe(32)
+                user_data = {
+                    "user_id": user_id,
+                    "username": username,
+                    "role": UserRole.USER.value,
+                    "enabled": 1,
+                    "created_at": created_at.isoformat(),
+                    "display_name": identity.display_name,
+                    "avatar_url": None,
+                    "preferences": "{}",
+                    "player_filter": "[]",
+                    "provider_filter": "[]",
+                }
+                link_data = {
+                    "link_id": link_id,
+                    "user_id": user_id,
+                    "provider_type": get_oidc_auth_provider_type().value,
+                    "provider_user_id": identity.provider_user_id,
+                    "created_at": created_at.isoformat(),
+                }
+                try:
+                    async with self.database.transaction() as connection:
+                        async with connection.execute(
+                            "SELECT user_id FROM user_auth_providers "
+                            "WHERE provider_type = :provider_type "
+                            "AND provider_user_id = :provider_user_id",
+                            {
+                                "provider_type": get_oidc_auth_provider_type().value,
+                                "provider_user_id": identity.provider_user_id,
+                            },
+                        ) as cursor:
+                            existing_link = await cursor.fetchone()
+                        if existing_link:
+                            linked_user_id = str(existing_link["user_id"])
+                        else:
+                            linked_user_id = None
+                            async with connection.execute(
+                                "INSERT INTO users "
+                                "(user_id, username, role, enabled, created_at, display_name, "
+                                "avatar_url, preferences, player_filter, provider_filter) "
+                                "VALUES (:user_id, :username, :role, :enabled, :created_at, "
+                                ":display_name, :avatar_url, :preferences, :player_filter, "
+                                ":provider_filter)",
+                                user_data,
+                            ):
+                                pass
+                            async with connection.execute(
+                                "INSERT INTO user_auth_providers "
+                                "(link_id, user_id, provider_type, provider_user_id, created_at) "
+                                "VALUES (:link_id, :user_id, :provider_type, :provider_user_id, "
+                                ":created_at)",
+                                link_data,
+                            ):
+                                pass
+                except IntegrityError as err:
+                    # If the identity was linked concurrently, the unique provider key tells
+                    # us which account won. Username collisions are retried with a new suffix.
+                    existing_user = await self.get_user_by_provider_link(
+                        get_oidc_auth_provider_type(),
+                        identity.provider_user_id,
+                        include_disabled=True,
+                    )
+                    if existing_user:
+                        if not existing_user.enabled:
+                            raise AuthenticationFailed(
+                                "User account is disabled", translation_key="user_account_disabled"
+                            ) from err
+                        return existing_user
+                    continue
+
+                if linked_user_id:
+                    existing_user = await self.get_user(linked_user_id, include_disabled=True)
+                    if not existing_user or not existing_user.enabled:
+                        raise AuthenticationFailed("This OIDC account is not available")
+                    return existing_user
+
+                user = User(
+                    user_id=user_id,
+                    username=username,
+                    role=UserRole.USER,
+                    enabled=True,
+                    created_at=created_at,
+                    display_name=identity.display_name,
+                    avatar_url=None,
+                    preferences={},
+                    player_filter=[],
+                )
+                self._has_users = True
+                self.logger.info("Created regular Music Assistant user from OIDC identity")
+                return user
+
+        raise AuthenticationFailed("The OIDC account could not be provisioned")
+
+    async def unlink_provider_links(
+        self,
+        user: User,
+        provider_type: AuthProviderType,
+        *,
+        link_id: str | None = None,
+    ) -> bool:
+        """
+        Remove one or more authentication links if another usable login method remains.
+
+        :param user: The account whose authentication links are changed.
+        :param provider_type: Provider type to remove.
+        :param link_id: Optional specific link to remove.
+        :return: True when the link is absent already or was removed.
+        :raises InvalidDataError: If the operation targets another user or removes the last login.
+        """
+        async with self._provider_link_lock, self.database.transaction() as connection:
+            async with connection.execute(
+                "SELECT link_id, user_id, provider_type FROM user_auth_providers "
+                "WHERE user_id = :user_id",
+                {"user_id": user.user_id},
+            ) as cursor:
+                user_links = await cursor.fetchall()
+            if link_id is not None:
+                async with connection.execute(
+                    "SELECT link_id, user_id, provider_type FROM user_auth_providers "
+                    "WHERE link_id = :link_id",
+                    {"link_id": link_id},
+                ) as cursor:
+                    target_link = await cursor.fetchone()
+                if target_link is not None and target_link["user_id"] != user.user_id:
+                    raise InvalidDataError("This authentication link belongs to another user")
+                selected = [
+                    row
+                    for row in user_links
+                    if row["link_id"] == link_id and row["provider_type"] == provider_type.value
+                ]
+            else:
+                selected = [
+                    row for row in user_links if row["provider_type"] == provider_type.value
+                ]
+            if not selected:
+                return True
+
+            selected_ids = {row["link_id"] for row in selected}
+            remaining_links = [row for row in user_links if row["link_id"] not in selected_ids]
+            if not any(self._provider_link_is_usable(row) for row in remaining_links):
+                raise InvalidDataError(
+                    "At least one usable login method must remain on the account",
+                    translation_key="last_auth_provider",
+                )
+            if link_id is not None:
+                await connection.execute(
+                    "DELETE FROM user_auth_providers WHERE user_id = :user_id "
+                    "AND provider_type = :provider_type AND link_id = :link_id",
+                    {
+                        "user_id": user.user_id,
+                        "provider_type": provider_type.value,
+                        "link_id": link_id,
+                    },
+                )
+            else:
+                await connection.execute(
+                    "DELETE FROM user_auth_providers WHERE user_id = :user_id "
+                    "AND provider_type = :provider_type",
+                    {"user_id": user.user_id, "provider_type": provider_type.value},
+                )
+        self.logger.info(
+            "Authentication provider '%s' unlinked from user (user_id=%s)",
+            provider_type.value,
+            user.user_id,
         )
+        return True
 
     async def update_user(
         self,
@@ -1197,6 +1452,10 @@ class AuthenticationManager:
         request_host: str | None = None,
         redirect_target: RedirectTarget = "server",
         code_challenge: str | None = None,
+        intent: AuthTransactionIntent = AuthTransactionIntent.LOGIN,
+        initiating_user_id: str | None = None,
+        initiating_session_hash: str | None = None,
+        callback_binding_hash: str | None = None,
     ) -> tuple[str, PendingLogin] | None:
         """
         Start a sign-in with a redirect provider and return its authorization URL.
@@ -1207,12 +1466,25 @@ class AuthenticationManager:
         :param request_host: The host (and any port) the client used to reach the server.
         :param redirect_target: Where the browser returns to; "app" must be validated first.
         :param code_challenge: The client's (validated) PKCE S256 code challenge, if any.
+        :param intent: The purpose of this transaction; linking is restricted to configured OIDC.
+        :param initiating_user_id: The user bound to an account-linking transaction.
+        :param initiating_session_hash: Hash of the active session for account linking.
+        :param callback_binding_hash: Hash of the one-time browser callback binding value.
         :return: The authorization URL and the started sign-in, or None when the provider
             does not exist, needs no redirect or is not reachable.
         :raises RateLimited: If too many sign-ins are pending.
         """
         provider = self.login_providers.get(provider_id)
         if not provider or not provider.requires_redirect:
+            return None
+        if intent is AuthTransactionIntent.LINK and (
+            not isinstance(provider, OIDCLoginProvider)
+            or transport is not AuthTransport.DIRECT
+            or redirect_target != "server"
+            or not initiating_user_id
+            or not initiating_session_hash
+            or not callback_binding_hash
+        ):
             return None
 
         if isinstance(provider, OIDCLoginProvider):
@@ -1236,6 +1508,19 @@ class AuthenticationManager:
             redirect_target=redirect_target,
             return_url=return_url,
             client_code_challenge=code_challenge,
+            intent=intent,
+            link_context=(
+                PendingLinkContext(
+                    initiating_user_id,
+                    initiating_session_hash,
+                    callback_binding_hash,
+                )
+                if intent is AuthTransactionIntent.LINK
+                and initiating_user_id
+                and initiating_session_hash
+                and callback_binding_hash
+                else None
+            ),
             idp_code_verifier=secrets.token_urlsafe(64),
         )
         auth_url = None
@@ -1247,7 +1532,13 @@ class AuthenticationManager:
         return (auth_url, pending) if auth_url else None
 
     async def handle_oauth_callback(
-        self, provider_id: str, code: str | None, state: str, error: str | None = None
+        self,
+        provider_id: str,
+        code: str | None,
+        state: str,
+        error: str | None = None,
+        *,
+        link_callback_binding: str | None = None,
     ) -> AuthResult:
         """
         Handle OAuth callback.
@@ -1264,6 +1555,15 @@ class AuthenticationManager:
         provider = self.login_providers.get(provider_id)
         if not provider:
             return AuthResult(success=False, error="Invalid provider")
+        user: User | None = None
+        if pending.intent is AuthTransactionIntent.LINK:
+            if not isinstance(provider, OIDCLoginProvider):
+                return AuthResult(success=False, error="Invalid account-linking provider")
+            user = await self._validate_pending_link_session(pending, link_callback_binding)
+            if user is None:
+                return AuthResult(
+                    success=False, error="The account-linking session is invalid or expired"
+                )
         if error:
             message = (
                 "Sign-in was cancelled"
@@ -1276,10 +1576,68 @@ class AuthenticationManager:
         if not AUTH_CODE_RE.fullmatch(code):
             return AuthResult(success=False, error="Invalid authorization code")
         try:
+            if pending.intent is AuthTransactionIntent.LINK:
+                assert isinstance(provider, OIDCLoginProvider)
+                assert user is not None
+                identity = await provider.verify_identity(pending, {"code": code})
+                user = await self._validate_pending_link_session(pending, link_callback_binding)
+                if user is None:
+                    return AuthResult(
+                        success=False,
+                        error="The account-linking session is invalid or expired",
+                    )
+                await self.link_user_to_provider(
+                    user,
+                    get_oidc_auth_provider_type(),
+                    identity.provider_user_id,
+                    required_session_hash=pending.initiating_session_hash,
+                )
+                return AuthResult(success=True, linked=True)
             user = await provider.complete_authorization(pending, {"code": code})
-        except AuthenticationFailed as err:
+        except (AuthenticationFailed, AuthenticationRequired, InvalidDataError) as err:
             return AuthResult(success=False, error=str(err))
         return AuthResult(success=True, user=user, return_url=pending.return_url)
+
+    async def start_oidc_link(
+        self, user: User, session_token: str
+    ) -> tuple[str, PendingLogin, str] | None:
+        """
+        Start an OIDC identity-linking transaction for an authenticated user's session.
+
+        :param user: The user making the account change.
+        :param session_token: The bearer token of the active Music Assistant session.
+        :return: The authorization URL, pending transaction and one-time browser binding.
+        :raises AuthenticationRequired: If the session is no longer valid.
+        :raises InsufficientPermissions: If the user may not manage their own account.
+        """
+        if not user.enabled:
+            raise AuthenticationRequired("The Music Assistant account is disabled")
+        if not has_scope(user, Scope.CONFIG_PROVIDERS_OWN):
+            raise InsufficientPermissions("You may not manage authentication for this account")
+        token_hash = hashlib.sha256(session_token.encode()).hexdigest()
+        session_row = await self.database.get_row("auth_tokens", {"token_hash": token_hash})
+        active_user = await self.authenticate_with_token(session_token)
+        if (
+            not session_row
+            or session_row["user_id"] != user.user_id
+            or active_user is None
+            or active_user.user_id != user.user_id
+        ):
+            raise AuthenticationRequired("A valid Music Assistant session is required")
+
+        callback_binding = secrets.token_urlsafe(32)
+        started = await self.get_authorization_url(
+            "oidc",
+            transport=AuthTransport.DIRECT,
+            intent=AuthTransactionIntent.LINK,
+            initiating_user_id=user.user_id,
+            initiating_session_hash=token_hash,
+            callback_binding_hash=hashlib.sha256(callback_binding.encode()).hexdigest(),
+        )
+        if not started:
+            return None
+        authorization_url, pending = started
+        return authorization_url, pending, callback_binding
 
     @api_command("auth/exchange", authenticated=False)
     async def exchange_authorization_code(
@@ -1839,7 +2197,7 @@ class AuthenticationManager:
 
         self.logger.info("User '%s' logged out", user.username)
 
-    @api_command("auth/user/providers")
+    @api_command("auth/user/providers", required_scope=Scope.CONFIG_PROVIDERS_OWN)
     async def get_my_providers(self) -> list[dict[str, Any]]:
         """
         Get current user's linked authentication providers.
@@ -1852,33 +2210,78 @@ class AuthenticationManager:
 
         # Get provider links from database
         rows = await self.database.get_rows("user_auth_providers", {"user_id": user.user_id})
-        providers = [UserAuthProvider.from_dict(dict(row)) for row in rows]
-        for provider in providers:
-            # the builtin link stores the password hash as its provider user id
-            if provider.provider_type == AuthProviderType.BUILTIN:
-                provider.provider_user_id = ""
-        return [p.to_dict() for p in providers]
+        return [
+            {
+                "link_id": row["link_id"],
+                "user_id": row["user_id"],
+                "provider_type": row["provider_type"],
+                # Password hashes and external identity keys are private storage details.
+                "provider_user_id": (
+                    row["provider_user_id"]
+                    if row["provider_type"] == AuthProviderType.HOME_ASSISTANT.value
+                    else ""
+                ),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
 
     @api_command("auth/user/unlink_provider", required_scope=Scope.USERS_MANAGE)
-    async def unlink_provider(self, user_id: str, provider_type: str) -> bool:
+    async def unlink_provider(self, user_id: str, provider_type: str, confirmed: bool) -> bool:
         """
-        Unlink authentication provider from user (admin only).
+        Unlink an authentication provider from a user (admin only).
 
         :param user_id: The user ID.
         :param provider_type: Provider type to unlink.
+        :param confirmed: Whether the administrator confirmed this security change.
         :return: True if successful.
         """
-        await self.database.delete(
-            "user_auth_providers", {"user_id": user_id, "provider_type": provider_type}
-        )
-        await self.database.commit()
+        admin_user = get_current_user()
+        if not admin_user:
+            raise AuthenticationRequired("Not authenticated")
+        if not confirmed:
+            raise InvalidDataError("Explicit confirmation is required")
+        await self._require_recent_user_session(admin_user)
+        try:
+            parsed_provider_type = AuthProviderType(provider_type)
+        except ValueError as err:
+            raise InvalidDataError("Unknown authentication provider") from err
+        if parsed_provider_type.value != provider_type:
+            raise InvalidDataError("Unknown authentication provider")
+        target_user = await self.get_user(user_id, include_disabled=True)
+        if target_user is None:
+            return True
+        return await self.unlink_provider_links(target_user, parsed_provider_type)
 
-        self.logger.info(
-            "Auth provider '%s' unlinked from user (user_id=%s)",
-            provider_type,
-            user_id,
+    @api_command("auth/oidc/unlink", required_scope=Scope.CONFIG_PROVIDERS_OWN)
+    async def unlink_my_oidc_provider(self, link_id: str, confirmed: bool) -> bool:
+        """Remove one OIDC login identity from the current user's account."""
+        user = get_current_user()
+        if not user:
+            raise AuthenticationRequired("Not authenticated")
+        if not confirmed:
+            raise InvalidDataError("Explicit confirmation is required")
+        await self._require_recent_user_session(user)
+        return await self.unlink_provider_links(
+            user, get_oidc_auth_provider_type(), link_id=link_id
         )
-        return True
+
+    @api_command("auth/oidc/registration_policy", required_scope=Scope.USERS_MANAGE)
+    async def get_oidc_registration_policy(self) -> dict[str, bool]:
+        """Return the active OIDC account-registration policy."""
+        config = getattr(self.webserver, "config", None)
+        return {
+            "enabled": bool(config and config.get_value(CONF_AUTH_OIDC_ALLOW_REGISTRATION, False))
+        }
+
+    @api_command("auth/oidc/registration_policy/set", required_scope=Scope.USERS_MANAGE)
+    async def set_oidc_registration_policy(self, enabled: bool) -> dict[str, bool]:
+        """Update the OIDC-specific account-registration policy (admin only)."""
+        await self.mass.config.save_core_config(
+            "webserver", {CONF_AUTH_OIDC_ALLOW_REGISTRATION: enabled}
+        )
+        self.logger.info("OIDC account registration policy set to %s", enabled)
+        return await self.get_oidc_registration_policy()
 
     # ==================== Join Code Methods ====================
 
@@ -2877,6 +3280,119 @@ class AuthenticationManager:
         if not provider:
             raise AuthenticationFailed("The login provider of this sign-in is not available")
         return await provider.complete_authorization(pending, {"code": code})
+
+    def _provider_link_is_usable(self, link_row: Mapping[str, Any] | Row) -> bool:
+        """Return whether a provider link can currently authenticate a user."""
+        provider_type = link_row["provider_type"]
+        if provider_type == AuthProviderType.BUILTIN.value:
+            return True
+        provider_ids = {
+            AuthProviderType.HOME_ASSISTANT.value: "homeassistant",
+            "oidc": "oidc",
+        }
+        provider_id = provider_ids.get(provider_type)
+        return bool(provider_id and provider_id in self.login_providers)
+
+    async def _require_recent_user_session(self, user: User) -> None:
+        """Require a current session created within the reauthentication window."""
+        session_token = get_current_token()
+        if not session_token:
+            raise AuthenticationRequired("Please sign in again to change account security")
+        token_hash = hashlib.sha256(session_token.encode()).hexdigest()
+        session_row = await self.database.get_row(
+            "auth_tokens", {"token_hash": token_hash, "user_id": user.user_id}
+        )
+        if not session_row or not self._session_row_is_valid(session_row):
+            raise AuthenticationRequired("Please sign in again to change account security")
+        created_at = datetime.fromisoformat(session_row["created_at"])
+        if created_at < utc() - timedelta(minutes=5):
+            raise AuthenticationRequired("Please sign in again to change account security")
+
+    @staticmethod
+    def _session_row_is_valid(session_row: Mapping[str, Any] | Row) -> bool:
+        """Return whether a stored session token is within its lifetime."""
+        now = utc()
+        expires_at = session_row["expires_at"]
+        if expires_at and datetime.fromisoformat(expires_at) <= now:
+            return False
+        return bool(session_row["is_long_lived"]) or (
+            datetime.fromisoformat(session_row["created_at"])
+            + timedelta(days=TOKEN_ABSOLUTE_MAX_EXPIRATION)
+            > now
+        )
+
+    async def _get_available_oidc_username(self, base_username: str, attempt: int) -> str:
+        """Return a username candidate that is not currently in use."""
+        for suffix in range(attempt * 100 + 1, (attempt + 1) * 100 + 1):
+            suffix_text = "" if suffix == 1 else f"-{suffix}"
+            candidate = f"{base_username[: 64 - len(suffix_text)]}{suffix_text}"
+            if candidate == normalize_username(HOMEASSISTANT_SYSTEM_USER):
+                continue
+            if not await self.database.get_row("users", {"username": candidate}):
+                return candidate
+        raise AuthenticationFailed("A unique Music Assistant username could not be assigned")
+
+    @staticmethod
+    def _provider_link_for_user(link_row: Mapping[str, Any] | Row, user: User) -> UserAuthProvider:
+        """Return an existing link when it belongs to the requested user."""
+        if link_row["user_id"] != user.user_id:
+            raise InvalidDataError(
+                "This authentication identity is already linked to another user",
+                translation_key="auth_provider_link_conflict",
+            )
+        return UserAuthProvider(
+            link_id=link_row["link_id"],
+            user_id=link_row["user_id"],
+            provider_type=AuthProviderType(link_row["provider_type"]),
+            provider_user_id=link_row["provider_user_id"],
+            created_at=datetime.fromisoformat(link_row["created_at"]),
+        )
+
+    async def _validate_pending_link_session(
+        self, pending: PendingLogin, callback_binding: str | None
+    ) -> User | None:
+        """Return the enabled user bound to this linking transaction, if still valid."""
+        if (
+            not pending.initiating_user_id
+            or not pending.initiating_session_hash
+            or not pending.callback_binding_hash
+            or not callback_binding
+        ):
+            return None
+        callback_hash = hashlib.sha256(callback_binding.encode()).hexdigest()
+        if not hmac.compare_digest(callback_hash, pending.callback_binding_hash):
+            return None
+        session_row = await self.database.get_row(
+            "auth_tokens", {"token_hash": pending.initiating_session_hash}
+        )
+        if (
+            not session_row
+            or session_row["user_id"] != pending.initiating_user_id
+            or not self._session_row_is_valid(session_row)
+        ):
+            return None
+        user = await self.get_user(pending.initiating_user_id, include_disabled=True)
+        if not user or not user.enabled or not has_scope(user, Scope.CONFIG_PROVIDERS_OWN):
+            return None
+        return user
+
+
+def oidc_link_cookie_name(state: str) -> str | None:
+    """Return the browser-binding cookie name for a well-formed OIDC link state."""
+    if not re.fullmatch(r"l\.[A-Za-z0-9_-]{43}", state):
+        return None
+    return OIDC_LINK_COOKIE_PREFIX + hashlib.sha256(state.encode()).hexdigest()[:24]
+
+
+def _oidc_username_base(identity: VerifiedOIDCIdentity) -> str:
+    """Derive a safe username candidate without using it to identify an MA account."""
+    preferred_username = identity.preferred_username or ""
+    username = re.sub(r"[^a-z0-9._-]+", "-", normalize_username(preferred_username))
+    username = username.strip("._-")[:64]
+    if len(username) >= USERNAME_MIN_LENGTH:
+        return username
+    identity_digest = hashlib.sha256(identity.provider_user_id.encode()).hexdigest()[:16]
+    return f"oidc-{identity_digest}"
 
 
 def _client_rate_limit_key() -> tuple[str, bool]:
